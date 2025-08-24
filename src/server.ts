@@ -11,9 +11,6 @@ import { router } from './routes';
 import { errorHandler } from './middleware/errorHandler';
 import { logger } from './lib/logger';
 
-/**
- * Safe pretty-printer for logged bodies
- */
 function safeBody(bodyStr?: string) {
   if (!bodyStr) return {};
   try {
@@ -22,14 +19,15 @@ function safeBody(bodyStr?: string) {
       if ('password' in obj) (obj as any).password = '[REDACTED]';
       return obj;
     }
-  } catch {
-    // ignore parse errors
-  }
+  } catch { /* ignore */ }
   return {};
 }
 
 export async function createServer() {
   const app = express();
+
+  // ---- Railway / proxy support ----
+  app.set('trust proxy', 1); // behind Railway/Ingress
 
   // Security + parsing
   app.use(helmet());
@@ -37,24 +35,17 @@ export async function createServer() {
   app.use(cors({ origin: true, credentials: true }));
   app.use(express.json({ limit: '1mb' }));
 
-  // ---- pino-http request/response logging (typesafe) ----
-  // NOTE: Do NOT pass our custom logger instance here to avoid generic type mismatches with pino-http.
-  // Let pino-http create its own internal logger; we’ll still use our `logger` elsewhere.
+  // ---- pino-http logging ----
   const httpLoggerOptions: PinoHttpOptions<IncomingMessage, ServerResponse> = {
-    autoLogging: {
-      // Predicate form required by typings
-      ignore: (_req: IncomingMessage): boolean => false
-    },
-
-    genReqId: (req: IncomingMessage, _res: ServerResponse) => {
+    autoLogging: { ignore: (_req: IncomingMessage) => false },
+    genReqId: (req: IncomingMessage) => {
       const headers = req.headers || {};
-      const existing =
+      return (
         (headers['x-request-id'] as string) ||
-        (headers['x-correlation-id'] as string);
-      // Must return a ReqId (string|number|symbol)
-      return existing || randomUUID();
+        (headers['x-correlation-id'] as string) ||
+        randomUUID()
+      );
     },
-
     serializers: {
       req(req: IncomingMessage) {
         const out: Record<string, unknown> = {
@@ -74,32 +65,26 @@ export async function createServer() {
         const ex = res as any;
         return {
           statusCode: ex.statusCode,
-          headers:
-            typeof ex.getHeaders === 'function' ? ex.getHeaders() : ({} as Record<string, unknown>)
+          headers: typeof ex.getHeaders === 'function' ? ex.getHeaders() : {}
         };
       }
     },
-
-    customSuccessMessage(req: IncomingMessage, res: ServerResponse): string {
+    customSuccessMessage(req, res) {
       const method = (req as any).method;
       const url = (req as any).url;
       const status = (res as any).statusCode;
       return `OK ${method} ${url} ${status}`;
     },
-
-    customErrorMessage(req: IncomingMessage, res: ServerResponse, err: Error): string {
+    customErrorMessage(req, res, err) {
       const method = (req as any).method;
       const url = (req as any).url;
       const status = (res as any).statusCode;
       return `ERR ${method} ${url} ${status} - ${err.message}`;
-    },
-
-    quietReqLogger: false
+    }
   };
-
   app.use(pinoHttp(httpLoggerOptions));
 
-  // Extra detailed timing + body snapshot using our app-level logger
+  // Extra detailed timing + body snapshot
   app.use((req: Request, res: Response, next: NextFunction) => {
     const start = process.hrtime.bigint();
     (req as any)._bodySnapshot = JSON.stringify(req.body ?? {});
@@ -121,14 +106,14 @@ export async function createServer() {
     next();
   });
 
-  // Basic rate limit (per IP)
+  // ---- Rate limit with safe key (works with proxies) ----
   app.use(
     rateLimit({
       windowMs: 15 * 60 * 1000,
       max: 100,
       standardHeaders: true,
       legacyHeaders: false,
-      message: 'Too many requests from this IP, try again later.'
+      keyGenerator: (req) => req.ip || (req.headers['x-forwarded-for'] as string) || 'unknown'
     })
   );
 

@@ -1,8 +1,9 @@
-# ---- Base image with Node + minimal OS deps ----
-FROM node:20-slim AS base
+# Use Debian bookworm so the chromium package is available
+FROM node:20-bookworm-slim AS deps
 
-# Puppeteer/Chromium dependencies
-RUN apt-get update && apt-get install -y \
+# System deps for Chromium
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium \
     ca-certificates \
     fonts-liberation \
     libasound2 \
@@ -34,45 +35,34 @@ RUN apt-get update && apt-get install -y \
     libxrender1 \
     libxss1 \
     libxtst6 \
-    wget \
     xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-# ---- Dependencies layer ----
+# Avoid downloading bundled Chromium (we use system package)
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+
 COPY package*.json ./
 COPY tsconfig.json ./
-RUN npm ci --omit=dev
+RUN npm ci
 
-# ---- Build stage ----
-FROM base AS build
-# Install dev deps for build
-RUN npm install -D typescript ts-node-dev @types/node @types/express @types/cors @types/hpp @types/morgan
+FROM deps AS build
 COPY . .
 RUN npm run build
 
-# ---- Runtime image ----
-FROM base AS runtime
+FROM deps AS runtime
 ENV NODE_ENV=production \
     PORT=3000 \
     PUPPETEER_HEADLESS=true \
-    # Railway ephemeral FS: disable session persistence by default
-    DISABLE_SESSION_PERSISTENCE=true
+    # point Puppeteer at system Chromium
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
-# Copy app code
+# Copy built artifacts and prod node_modules
 COPY --from=build /app/dist /app/dist
-COPY package*.json ./
-
-# Ensure a clean, production-only node_modules is present
+COPY --from=build /app/package*.json /app/
+# ensure prod deps only (in case dev snuck in)
 RUN npm ci --omit=dev
 
-# Puppeteer runtime flags (already in code, but env-friendly here)
-ENV PUPPETEER_SKIP_DOWNLOAD=false
-
-# Expose port for Railway
 EXPOSE 3000
-
-# Start
 CMD ["node", "dist/index.js"]
