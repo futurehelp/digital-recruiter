@@ -11,7 +11,12 @@ import {
   generateOverallRating,
   getProfileRating
 } from '../services/analysisService';
-import { TestAnalysisSchema, AnalyzeProfileSchema, BulkAnalyzeSchema, RateCompanySchema } from '../schemas';
+import {
+  TestAnalysisSchema,
+  AnalyzeProfileSchema,
+  BulkAnalyzeSchema,
+  RateCompanySchema
+} from '../schemas';
 import { mockProfile } from '../mocks/mockProfile';
 import { ExperienceAnalysis, LinkedInProfile } from '../types';
 import { logger } from '../lib/logger';
@@ -25,19 +30,21 @@ export const health = (_req: Request, res: Response) => {
 export const testAnalysis = async (req: Request, res: Response) => {
   const { linkedinUrl } = TestAnalysisSchema.parse(req.body);
 
-  logger.info({ linkedinUrl }, '🧪 Running test analysis (mock profile, all employers & roles)');
+  logger.info(
+    { linkedinUrl },
+    '🧪 Running test analysis (mock profile, all employers & roles)'
+  );
 
   const profileData: LinkedInProfile = parseLinkedInProfile(mockProfile);
 
-  // Analyze ALL employers (no depth limit)
+  // 1) All employers
   const employerAnalysis = await analyzeAllEmployers(profileData.workHistory);
 
-  // Map for quick lookup
+  // 2) Every role with company context
   const byName = new Map(
     employerAnalysis.map((c) => [c.name.toLowerCase(), c])
   );
 
-  // Analyze every role
   const experienceAnalyses: ExperienceAnalysis[] = [];
   for (const ex of profileData.workHistory) {
     const company = byName.get((ex.company || '').toLowerCase());
@@ -47,13 +54,27 @@ export const testAnalysis = async (req: Request, res: Response) => {
     }
   }
 
+  // 3) Overall rating
   const overallRating = await generateOverallRating(
     profileData,
     employerAnalysis,
     experienceAnalyses
   );
 
+  // 4) Profile component rating
   const profileRating = await getProfileRating(profileData);
+
+  // 🔊 Log final overall rating for backend observability (Railway)
+  logger.info(
+    {
+      url: linkedinUrl,
+      score: overallRating.score,
+      grade: overallRating.grade,
+      finalGrade: overallRating.finalGrade,
+      finalScore10: overallRating.finalScore10
+    },
+    `🎓 Overall Rating → ${overallRating.finalGrade} (${overallRating.finalScore10}/10)`
+  );
 
   res.json({
     profileUrl: linkedinUrl,
@@ -80,16 +101,16 @@ export const analyzeProfile = async (req: Request, res: Response) => {
     return;
   }
 
-  logger.info({ linkedinUrl }, 'Starting full analysis (ALL employers & roles)');
+  logger.info({ linkedinUrl }, '🚀 Starting full analysis (ALL employers & roles)');
 
-  // Step 1: Scrape and parse profile
+  // 1) Scrape + parse profile
   const raw = await analyzeLinkedInProfile(linkedinUrl);
   const profileData = parseLinkedInProfile(raw);
 
-  // Step 2: Analyze ALL employers (no depth)
+  // 2) All employers
   const employerAnalysis = await analyzeAllEmployers(profileData.workHistory);
 
-  // Step 3: Analyze EVERY role with company context
+  // 3) Each role
   const byName = new Map(
     employerAnalysis.map((c) => [c.name.toLowerCase(), c])
   );
@@ -102,15 +123,27 @@ export const analyzeProfile = async (req: Request, res: Response) => {
     }
   }
 
-  // Step 4: Overall rating (profile + companies + roles)
+  // 4) Overall rating (profile + companies + roles)
   const overallRating = await generateOverallRating(
     profileData,
     employerAnalysis,
     experienceAnalyses
   );
 
-  // Step 5: Detailed profile components
+  // 5) Profile component rating
   const profileRating = await getProfileRating(profileData);
+
+  // 🔊 Log final overall rating for backend observability (Railway)
+  logger.info(
+    {
+      url: linkedinUrl,
+      score: overallRating.score,
+      grade: overallRating.grade,
+      finalGrade: overallRating.finalGrade,
+      finalScore10: overallRating.finalScore10
+    },
+    `🎓 Overall Rating → ${overallRating.finalGrade} (${overallRating.finalScore10}/10)`
+  );
 
   res.json({
     profileUrl: linkedinUrl,
@@ -132,6 +165,12 @@ export const rateCompany = async (req: Request, res: Response) => {
   const { companyName, companyUrl } = RateCompanySchema.parse(req.body);
 
   const rating = await analyzeCompany(companyName, companyUrl);
+
+  // Optional: log single-company rating
+  logger.info(
+    { company: companyName, overall: rating.overallScore },
+    `🏢 Company Rating → ${rating.name}: ${rating.overallScore}/10`
+  );
 
   res.json({
     company: companyName,
@@ -161,11 +200,14 @@ export const bulkAnalyze = async (req: Request, res: Response) => {
         continue;
       }
 
+      // Profile
       const raw = await analyzeLinkedInProfile(url);
       const profileData = parseLinkedInProfile(raw);
 
+      // Companies
       const employerAnalysis = await analyzeAllEmployers(profileData.workHistory);
 
+      // Roles
       const byName = new Map(
         employerAnalysis.map((c) => [c.name.toLowerCase(), c])
       );
@@ -179,10 +221,23 @@ export const bulkAnalyze = async (req: Request, res: Response) => {
         }
       }
 
+      // Overall
       const overallRating = await generateOverallRating(
         profileData,
         employerAnalysis,
         experienceAnalyses
+      );
+
+      // 🔊 Log final overall rating per profile
+      logger.info(
+        {
+          url,
+          score: overallRating.score,
+          grade: overallRating.grade,
+          finalGrade: overallRating.finalGrade,
+          finalScore10: overallRating.finalScore10
+        },
+        `🎓 Overall Rating for ${url} → ${overallRating.finalGrade} (${overallRating.finalScore10}/10)`
       );
 
       results.push({
@@ -194,6 +249,7 @@ export const bulkAnalyze = async (req: Request, res: Response) => {
         summary: overallRating.summary
       });
     } catch (err) {
+      logger.error({ url, err }, 'Bulk analyze failed for profile');
       results.push({
         url,
         error: err instanceof Error ? err.message : 'Analysis failed'

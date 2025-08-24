@@ -58,6 +58,29 @@ function tenureMonthsFrom(ex: WorkExperience): number {
   return Math.max(0, diff);
 }
 
+function hasAny(text: string, kws: string[]) {
+  const t = text.toLowerCase();
+  return kws.some((k) => t.includes(k));
+}
+
+function seniorityLevel(position = '', companyName = ''): number {
+  const t = `${position} ${companyName}`.toLowerCase();
+  // Strong senior signals
+  if (
+    hasAny(t, [
+      'cto', 'chief technology officer', 'ceo', 'coo', 'cso',
+      'founder', 'co-founder', 'cofounder',
+      'distinguished', 'fellow',
+      'principal engineer', 'principal scientist',
+      'member of technical staff', 'mts', 'staff engineer', 'staff scientist',
+      'executive director'
+    ])
+  ) return 2.5;
+  // Moderate senior signals
+  if (hasAny(t, ['vp', 'svp', 'evp', 'director', 'head of', 'lead', 'senior'])) return 1.5;
+  return 0;
+}
+
 function heuristicRoleAnalysis(
   ex: WorkExperience,
   company?: CompanyRating
@@ -65,53 +88,71 @@ function heuristicRoleAnalysis(
   const desc = (ex.description || '').toLowerCase();
   const len = ex.description ? ex.description.length : 0;
 
-  const has = (...ks: string[]) => ks.some((k) => desc.includes(k));
+  // Start from **neutral baselines** (not punitive)
+  let impact = 6.0;
+  let scope = 6.0;
+  let complexity = 6.0;
 
-  let impact = 3 + Math.min(len / 250, 4);
-  if (has('led', 'delivered', 'launched', 'shipped', 'drove')) impact += 1.5;
-  if (has('kpi', 'revenue', 'growth', 'adoption', 'retention', 'nps')) impact += 1;
-  if (/\b\d{1,3}k\b|\b\d{1,3}m\b|\b\d{1,3}%\b/.test(desc)) impact += 0.5;
+  // Seniority bumps (Founder/CTO/Staff/Principal/Director/VP/etc.)
+  const seniorBump = seniorityLevel(ex.position, ex.company);
+  impact += seniorBump * 0.8;
+  scope += seniorBump * 1.1;
+  complexity += seniorBump * 0.6;
 
-  let scope = 3;
-  if (has('team', 'managed', 'manager', 'lead')) scope += 1.5;
-  if (has('cross-functional', 'stakeholder', 'executive', 'c-level')) scope += 1;
-  if (company && company.size && /([1-9]\d{2,})/.test(company.size)) scope += 0.5; // bigger org
+  // Company size/quality gives small scope/context boost
+  if (company) {
+    if (company.overallScore >= 8.5) {
+      impact += 0.6; scope += 0.8; complexity += 0.4;
+    } else if (company.overallScore >= 7.5) {
+      impact += 0.3; scope += 0.4; complexity += 0.2;
+    }
+  }
 
-  let complexity = 3;
-  if (has('distributed', 'scalable', 'microservices', 'concurrency')) complexity += 1;
-  if (has('ml', 'machine learning', 'nlp', 'cv')) complexity += 1;
-  if (has('kubernetes', 'k8s', 'docker', 'aws', 'gcp', 'azure')) complexity += 0.5;
-  if (has('security', 'compliance', 'pci', 'soc2', 'hipaa')) complexity += 0.5;
+  // Content signals
+  const delivered = hasAny(desc, ['led', 'delivered', 'launched', 'shipped', 'drove', 'built']);
+  const metrics = /\b\d{1,3}k\b|\b\d{1,3}m\b|\b\d{1,3}b\b|\b\d{1,3}%\b|\b(?:million|billion|thousand)\b/.test(desc);
+  const scale = hasAny(desc, ['scale', 'scalable', 'throughput', 'latency', 'p99', 'reliability']);
+  const cloud = hasAny(desc, ['kubernetes', 'k8s', 'docker', 'aws', 'gcp', 'azure']);
+  const ml = hasAny(desc, ['ml', 'machine learning', 'nlp', 'cv', 'reinforcement learning', 'rl']);
 
+  if (delivered) impact += 0.6;
+  if (metrics) impact += 0.5;
+  if (scale) complexity += 0.5;
+  if (cloud) complexity += 0.3;
+  if (ml) { impact += 0.2; complexity += 0.6; }
+
+  // Tenure adjustments (small, bounded)
   const tenureMonths = tenureMonthsFrom(ex);
+  if (tenureMonths >= 48) { impact += 0.4; scope += 0.5; }
+  else if (tenureMonths >= 24) { impact += 0.2; scope += 0.3; }
+  else if (tenureMonths > 0 && tenureMonths < 6) { impact -= 0.4; scope -= 0.4; complexity -= 0.2; }
 
+  // Sparse description => do NOT punish harshly; just add a risk
   const highlights: string[] = [];
-  if (has('led', 'launched', 'delivered')) highlights.push('Delivered/led key initiatives');
-  if (has('scaled', 'performance', 'reliability')) highlights.push('Scaled performance/reliability');
-  if (has('aws', 'gcp', 'azure', 'kubernetes')) highlights.push('Modern cloud-native stack');
-  if (/\b\d{2,}%\b/.test(desc)) highlights.push('Quantified outcomes');
+  if (delivered) highlights.push('Delivered/led key initiatives');
+  if (scale) highlights.push('Scaled performance/reliability');
+  if (cloud) highlights.push('Modern cloud-native stack');
+  if (metrics) highlights.push('Reported quantifiable outcomes');
 
   const risks: string[] = [];
   if (len < 80) risks.push('Sparse role description');
-  if (tenureMonths < 6) risks.push('Short tenure (<6 months)');
-  if (!/\b(react|node|python|java|go|rust|aws|gcp|azure|ml)\b/.test(desc))
-    risks.push('Few verifiable tech signals');
+  if (tenureMonths > 0 && tenureMonths < 6) risks.push('Short tenure (<6 months)');
+  if (!ml && !cloud && !scale && !metrics && len < 120) risks.push('Few verifiable signals');
 
   const fitSignals: string[] = [];
-  if (has('ownership', 'end-to-end', 'accountable')) fitSignals.push('Ownership mindset');
-  if (has('mentor', 'mentored', 'coached')) fitSignals.push('Mentorship/leadership capacity');
-  if (has('data-driven', 'experiment', 'ab test')) fitSignals.push('Evidence-based decision-making');
+  if (hasAny(desc, ['ownership', 'end-to-end', 'accountable'])) fitSignals.push('Ownership mindset');
+  if (hasAny(desc, ['mentor', 'mentored', 'coached'])) fitSignals.push('Mentorship');
+  if (hasAny(desc, ['data-driven', 'ab test', 'experiment'])) fitSignals.push('Evidence-based decisions');
 
   return {
     impactScore: clamp(impact, 1, 10),
     scopeScore: clamp(scope, 1, 10),
     complexityScore: clamp(complexity, 1, 10),
     tenureMonths,
-    highlights: highlights.slice(0, 5),
-    risks: risks.slice(0, 5),
-    fitSignals: fitSignals.slice(0, 5),
-    summary:
-      'Role analyzed using heuristic signals due to limited/uncertain AI response.'
+    highlights: highlights.slice(0, 6),
+    risks: risks.slice(0, 6),
+    fitSignals: fitSignals.slice(0, 6),
+    summary: 'Role scored with neutral baseline; boosted by seniority, employer quality, and content signals.'
   };
 }
 
@@ -147,7 +188,6 @@ Analyze job role:
 ${JSON.stringify(input)}`
   );
 
-  // If AI provided valid role fields, use them; else fallback to heuristics.
   const impactScore = Number(ai?.impactScore);
   const scopeScore = Number(ai?.scopeScore);
   const complexityScore = Number(ai?.complexityScore);
@@ -160,9 +200,9 @@ ${JSON.stringify(input)}`
   if (ok) {
     const tenureMonths = tenureMonthsFrom(experience);
     return {
-      impactScore: Math.max(1, Math.min(10, impactScore)),
-      scopeScore: Math.max(1, Math.min(10, scopeScore)),
-      complexityScore: Math.max(1, Math.min(10, complexityScore)),
+      impactScore: clamp(impactScore, 1, 10),
+      scopeScore: clamp(scopeScore, 1, 10),
+      complexityScore: clamp(complexityScore, 1, 10),
       tenureMonths,
       highlights: Array.isArray(ai?.highlights) ? ai.highlights.slice(0, 8) : [],
       risks: Array.isArray(ai?.risks) ? ai.risks.slice(0, 8) : [],
@@ -172,6 +212,9 @@ ${JSON.stringify(input)}`
     };
   }
 
-  // Fallback
+  // Fallback (neutral baselines + signals)
   return heuristicRoleAnalysis(experience, company);
 }
+
+// Exported for use in score weighting (company-by-tenure)
+export { tenureMonthsFrom };

@@ -81,8 +81,29 @@ export interface TimelineItem {
 }
 
 export interface OverallRating {
+  /**
+   * Precise blended score on a 0–10 scale (one decimal).
+   */
   score: number;
+
+  /**
+   * Detailed grade (with +/- granularity). Kept for backward compatibility.
+   * Example: "A+", "A", "A-", "B+", ..., "F"
+   */
   grade: string;
+
+  /**
+   * NEW: Simple letter grade on A–F scale (no +/-), as requested.
+   * Mapping uses typical breakpoints: A ≥ 9.0, B ≥ 8.0, C ≥ 7.0, D ≥ 6.0, else F.
+   */
+  finalGrade: 'A' | 'B' | 'C' | 'D' | 'F';
+
+  /**
+   * NEW: Rounded integer score from 1 to 10 (i.e., “1 out of 10”).
+   * We clamp to [1,10] so extremely low blended scores still report at least 1.
+   */
+  finalScore10: number;
+
   summary: string;
   strengths: string[];
   weaknesses: string[];
@@ -90,7 +111,7 @@ export interface OverallRating {
   riskFactors: string[];
   marketValue: string;
 
-  // Added for the "analyze every employer + role" requirement
-  careerSummary: string;     // high-level narrative summary (often mirrors `summary` but tailored to career)
-  timeline: TimelineItem[];  // computed timeline of roles
+  // High-level career narrative + chronological roles
+  careerSummary: string;
+  timeline: TimelineItem[];
 }
