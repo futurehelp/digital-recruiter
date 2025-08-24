@@ -10,16 +10,14 @@ const EnvSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   FORCE_MOCK_AI: z.string().default('false'),
 
-  // ── Scraper toggles ──────────────────────────────────────────────────────────
-  // Force a brand-new LinkedIn login for every analysis (no cookies, no session).
-  // This is what you asked for. Set to 'false' only if you later add persistence.
-  ALWAYS_FRESH_LOGIN: z
-    .string()
-    .default('true')
-    .transform(v => v === 'true'),
-
+  // Browser toggles
   PUPPETEER_HEADLESS: z.string().default('true'),
   PUPPETEER_EXECUTABLE_PATH: z.string().optional(),
+  HEADFUL: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+  CHROME_USER_DATA_DIR: z.string().default('/tmp/chrome-data'),
 
   // Timeouts / pacing
   REQUEST_DELAY_MS: z.coerce.number().default(45000),

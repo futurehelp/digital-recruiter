@@ -1,9 +1,10 @@
-# Use Debian bookworm so the chromium package is available
+# Debian bookworm has chromium + xvfb
 FROM node:20-bookworm-slim AS deps
 
-# System deps for Chromium
+# Install Chromium + Xvfb + required libs
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
+    xvfb \
     ca-certificates \
     fonts-liberation \
     libasound2 \
@@ -40,29 +41,38 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Avoid downloading bundled Chromium (we use system package)
+# We use system chromium; skip downloading a bundled one
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 
 COPY package*.json ./
 COPY tsconfig.json ./
 RUN npm ci
 
+# ---- Build
 FROM deps AS build
 COPY . .
 RUN npm run build
 
+# ---- Runtime
 FROM deps AS runtime
 ENV NODE_ENV=production \
     PORT=3000 \
+    # Force system Chromium
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
+    # Default to headless; set HEADFUL=true to run via Xvfb
     PUPPETEER_HEADLESS=true \
-    # point Puppeteer at system Chromium
-    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+    HEADFUL=false \
+    # Ephemeral user data dir (helps reduce some headless heuristics)
+    CHROME_USER_DATA_DIR=/tmp/chrome-data
 
-# Copy built artifacts and prod node_modules
+# Copy built output and re-prune dev deps
 COPY --from=build /app/dist /app/dist
 COPY --from=build /app/package*.json /app/
-# ensure prod deps only (in case dev snuck in)
 RUN npm ci --omit=dev
 
+# Entrypoint script switches to Xvfb if HEADFUL=true
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 EXPOSE 3000
-CMD ["node", "dist/index.js"]
+CMD ["/entrypoint.sh"]
