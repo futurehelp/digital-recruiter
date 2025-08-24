@@ -2,11 +2,8 @@ import type { Page } from 'puppeteer';
 import { env } from '../lib/env';
 import { logger } from '../lib/logger';
 import { enforceRateLimit, newPage, limiter } from '../lib/browser';
-import { loadSession, saveSession } from '../lib/session';
 import { LinkedInProfile, Education, WorkExperience } from '../types';
 import { parseIntSafe } from '../utils/validators';
-
-let isAuthenticated = false;
 
 async function humanDelay(min = 300, max = 900) {
   const ms = Math.floor(min + Math.random() * (max - min));
@@ -34,6 +31,10 @@ async function scrollToBottom(page: Page, step = 250, pause = 120) {
   );
 }
 
+/**
+ * Always performs a fresh LinkedIn login.
+ * No cookie/session persistence is used (by design).
+ */
 export async function authenticateLinkedIn(): Promise<Page> {
   if (!env.LINKEDIN_EMAIL || !env.LINKEDIN_PASSWORD) {
     throw new Error('LinkedIn credentials required in environment variables');
@@ -41,21 +42,7 @@ export async function authenticateLinkedIn(): Promise<Page> {
 
   const page = await newPage();
 
-  try {
-    await loadSession(page);
-    await page.goto('https://www.linkedin.com/feed/', {
-      waitUntil: 'domcontentloaded',
-      timeout: env.PAGE_TIMEOUT_MS
-    });
-    if (page.url().includes('/feed')) {
-      logger.info('Authenticated with existing session');
-      isAuthenticated = true;
-      return page;
-    }
-  } catch {
-    logger.info('No valid session; performing login...');
-  }
-
+  // Go directly to login (skip any attempt to load sessions)
   await page.goto('https://www.linkedin.com/login', {
     waitUntil: 'domcontentloaded',
     timeout: env.PAGE_TIMEOUT_MS
@@ -77,14 +64,12 @@ export async function authenticateLinkedIn(): Promise<Page> {
   const currentUrl = page.url();
   if (currentUrl.includes('/challenge') || currentUrl.includes('/checkpoint')) {
     logger.warn('Security challenge detected; may require manual intervention.');
-    // Give operator time to resolve challenge if running non-headless
+    // Give operator time if running non-headless
     await new Promise((r) => setTimeout(r, 30000));
   }
 
   if (!currentUrl.includes('/login')) {
-    logger.info('LinkedIn authentication successful');
-    isAuthenticated = true;
-    await saveSession(page);
+    logger.info('LinkedIn authentication successful (fresh login)');
     return page;
   }
 
@@ -94,15 +79,8 @@ export async function authenticateLinkedIn(): Promise<Page> {
 export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
   await enforceRateLimit();
 
-  const page = isAuthenticated ? await newPage() : await authenticateLinkedIn();
-  if (!isAuthenticated) {
-    // If we just authenticated, session is on "page"; else new page needs cookies
-    try {
-      await loadSession(page);
-    } catch {
-      // ignore
-    }
-  }
+  // Always start with a fresh login (per requirement)
+  const page = await authenticateLinkedIn();
 
   try {
     logger.info({ profileUrl }, 'Scraping profile');
@@ -115,7 +93,6 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
       timeout: env.ELEMENT_TIMEOUT_MS
     });
 
-    // Let async content load, then scroll
     await new Promise((r) => setTimeout(r, 4000));
     await scrollToBottom(page);
     await new Promise((r) => setTimeout(r, 2000));
@@ -127,11 +104,9 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
           .replace(/(.+?)\1+/g, '$1')
           .trim();
 
-      const textContent = (sel: string) => clean(document.querySelector(sel)?.textContent);
+      const findSectionById = (id: string) =>
+        document.querySelector(`#${CSS.escape(id)}`)?.closest('section');
 
-      const findSectionById = (id: string) => document.querySelector(`#${CSS.escape(id)}`)?.closest('section');
-
-      // Helpers for dates in "Jan 2022 - Present · 2 yrs"
       function extractStart(duration: string): string {
         const m = duration.match(/([A-Za-z]{3,9}\s+\d{4})/);
         return m ? m[1] : '';
@@ -164,20 +139,17 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
         connections: '0'
       };
 
-      // About/Summary
       const aboutSection = findSectionById('about');
       if (aboutSection) {
         const content = aboutSection.querySelector('.display-flex')?.textContent;
         profile.summary = clean(content);
       }
 
-      // Experience
       const expSection = findSectionById('experience');
       if (expSection) {
         const items = expSection.querySelectorAll('li.artdeco-list__item');
         items.forEach((li) => {
           const position = clean(li.querySelector('.t-bold')?.textContent);
-          // company label sometimes in span.t-14.t-normal, or nested a
           const company = clean(
             li.querySelector('.t-14.t-normal')?.textContent ||
               li.querySelector('.t-normal span')?.textContent
@@ -204,7 +176,6 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
         });
       }
 
-      // Skills
       const skillsSection = findSectionById('skills');
       if (skillsSection) {
         const skillEls = skillsSection.querySelectorAll('span.t-bold');
@@ -214,7 +185,6 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
         });
       }
 
-      // Education
       const eduSection = findSectionById('education');
       if (eduSection) {
         const items = eduSection.querySelectorAll('li.artdeco-list__item');
@@ -231,7 +201,6 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
         });
       }
 
-      // Connections text often like "500+ connections"
       const connectionsText = clean(
         document.querySelector('[data-view-name="profile-card"]')?.textContent ||
           document.body.textContent || ''
@@ -269,24 +238,21 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
     try {
       await page.close();
     } catch {
-      // ignore
+      /* ignore */
     }
   }
 }
 
-export function calculateProfileStrength(data: any): number {
-  let score = 0;
-  if (data.name) score += 15;
-  if (data.title) score += 15;
-  if (data.summary && data.summary.length > 50) score += 20;
-  if (data.workHistory && data.workHistory.length > 0) score += 25;
-  if (data.education && data.education.length > 0) score += 10;
-  if (data.skills && data.skills.length >= 3) score += 15;
-  return Math.min(score, 100);
+// Public: high-level function used by controllers
+export async function analyzeLinkedInProfile(linkedinUrl: string) {
+  return limiter.schedule(async () => {
+    const raw = await scrapeLinkedInProfile(linkedinUrl);
+    return raw;
+  });
 }
 
 export function parseLinkedInProfile(rawData: any): LinkedInProfile {
-  const normalizeWork = (items: any[]): WorkExperience[] =>
+  const normalizeWork = (items: any[]): any[] =>
     (items || []).map((x) => ({
       company: x.company || 'Unknown',
       position: x.position || 'Unknown',
@@ -297,7 +263,7 @@ export function parseLinkedInProfile(rawData: any): LinkedInProfile {
       location: x.location
     }));
 
-  const normalizeEdu = (items: any[]): Education[] =>
+  const normalizeEdu = (items: any[]): any[] =>
     (items || []).map((x) => ({
       institution: x.institution || 'Unknown',
       degree: x.degree || 'Degree not specified',
@@ -306,25 +272,26 @@ export function parseLinkedInProfile(rawData: any): LinkedInProfile {
       endYear: x.endYear
     }));
 
-  const connections = parseIntSafe(rawData.connections, 0);
+  const connections = parseInt(rawData.connections) || 0;
+
+  // Simple profileStrength heuristic
+  let score = 0;
+  if (rawData.name) score += 15;
+  if (rawData.title) score += 15;
+  if (rawData.summary && rawData.summary.length > 50) score += 20;
+  if (rawData.workHistory && rawData.workHistory.length > 0) score += 25;
+  if (rawData.education && rawData.education.length > 0) score += 10;
+  if (rawData.skills && rawData.skills.length >= 3) score += 15;
 
   return {
     name: rawData.name || 'Unknown',
     title: rawData.title || 'No title',
     location: rawData.location || 'Unknown',
     summary: rawData.summary || 'No summary available',
-    workHistory: normalizeWork(rawData.workHistory || []),
-    education: normalizeEdu(rawData.education || []),
-    skills: (rawData.skills || []) as string[],
+    workHistory: normalizeWork(rawData.workHistory),
+    education: normalizeEdu(rawData.education),
+    skills: rawData.skills || [],
     connections,
-    profileStrength: calculateProfileStrength(rawData)
+    profileStrength: Math.min(score, 100)
   };
-}
-
-// Public: high-level function used by controllers
-export async function analyzeLinkedInProfile(linkedinUrl: string) {
-  return limiter.schedule(async () => {
-    const raw = await scrapeLinkedInProfile(linkedinUrl);
-    return raw;
-  });
 }
