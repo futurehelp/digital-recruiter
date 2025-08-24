@@ -1,11 +1,12 @@
 # Debian bookworm has chromium + xvfb
 FROM node:20-bookworm-slim AS deps
 
-# Install Chromium + Xvfb + required libs
+# Install Chromium + Xvfb + xauth (needed by xvfb-run) + curl for healthcheck + runtime libs
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     xvfb \
     xauth \
+    curl \
     ca-certificates \
     fonts-liberation \
     libasound2 \
@@ -42,7 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# We use system Chromium; skip downloading a bundled one
+# We use system chromium; skip downloading a bundled one
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 
 COPY package*.json ./
@@ -58,22 +59,25 @@ RUN npm run build
 FROM deps AS runtime
 ENV NODE_ENV=production \
     PORT=3000 \
-    # Force system Chromium
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
-    # Default to headless; set HEADFUL=true to run via Xvfb
     PUPPETEER_HEADLESS=true \
     HEADFUL=false \
-    # Ephemeral user profile dir (helps reduce some automation fingerprints)
-    CHROME_USER_DATA_DIR=/tmp/chrome-data
+    CHROME_USER_DATA_DIR=/tmp/chrome-data \
+    STARTUP_BROWSER_CHECK=true \
+    LOG_LEVEL=info
 
 # Copy built output and re-prune dev deps
 COPY --from=build /app/dist /app/dist
 COPY --from=build /app/package*.json /app/
 RUN npm ci --omit=dev
 
-# Entrypoint script switches to Xvfb if HEADFUL=true
+# Entrypoint script switches to Xvfb if HEADFUL=true, prints diagnostics
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+# Basic Docker healthcheck hitting our /health endpoint
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=5 \
+  CMD curl -fsS http://localhost:3000/health || exit 1
 
 EXPOSE 3000
 CMD ["/entrypoint.sh"]

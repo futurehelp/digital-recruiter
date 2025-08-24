@@ -22,14 +22,12 @@ function firstExisting(paths: Array<string | undefined>): string | undefined {
 }
 
 function resolveExecutablePath(): string | undefined {
-  // 1) env-provided path, if present in the container
   const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
   const chosenEnv = firstExisting([envPath]);
   if (chosenEnv) {
-    logger.info({ executablePath: chosenEnv }, 'Using PUPPETEER_EXECUTABLE_PATH');
+    logger.info({ executablePath: chosenEnv }, '[browser] using PUPPETEER_EXECUTABLE_PATH');
     return chosenEnv;
   }
-  // 2) common Linux paths
   const linux = firstExisting([
     '/usr/bin/chromium',
     '/usr/bin/chromium-browser',
@@ -37,21 +35,22 @@ function resolveExecutablePath(): string | undefined {
     '/usr/bin/google-chrome-stable'
   ]);
   if (linux) {
-    logger.info({ executablePath: linux }, 'Using system Chromium');
+    logger.info({ executablePath: linux }, '[browser] using system Chromium');
     return linux;
   }
-  // 3) bundled fallback (if installed)
   try {
     const puppeteer = require('puppeteer');
     if (typeof puppeteer.executablePath === 'function') {
       const bundled: string = puppeteer.executablePath();
       if (bundled && existsSync(bundled)) {
-        logger.info({ executablePath: bundled }, 'Using bundled Chromium');
+        logger.info({ executablePath: bundled }, '[browser] using bundled Chromium');
         return bundled;
       }
     }
-  } catch { /* ignore */ }
-  logger.warn('No executablePath found; letting Puppeteer choose default.');
+  } catch (err) {
+    logger.warn({ err }, '[browser] failed to resolve bundled chromium');
+  }
+  logger.warn('[browser] no executablePath found; letting Puppeteer choose default');
   return undefined;
 }
 
@@ -69,7 +68,6 @@ async function launchBrowser(): Promise<Browser> {
     '--disable-web-security',
     '--window-size=1366,768',
     '--lang=en-US,en',
-    // reduce automation fingerprints
     '--disable-blink-features=AutomationControlled',
     '--disable-features=IsolateOrigins,site-per-process',
     '--password-store=basic',
@@ -83,15 +81,17 @@ async function launchBrowser(): Promise<Browser> {
     defaultViewport: { width: 1366, height: 768 }
   };
 
-  logger.info({ headless, executablePath: executablePath ?? '(auto)' }, 'Launching browser…');
+  logger.info({ headless, executablePath: executablePath ?? '(auto)', args }, '[browser] launching…');
   const b = await puppeteerExtra.launch(opts);
 
   b.on('disconnected', async () => {
-    logger.warn('Browser disconnected — will relaunch on next request');
+    logger.warn('[browser] disconnected — will relaunch on next request');
     browser = null;
   });
 
-  logger.info('Browser launched');
+  const version = await b.version().catch(() => 'unknown');
+  logger.info({ version }, '[browser] launched');
+
   return b;
 }
 
@@ -100,7 +100,8 @@ export async function getBrowser(): Promise<Browser> {
     try {
       await browser.version(); // throws if dead
       return browser;
-    } catch {
+    } catch (err) {
+      logger.warn({ err }, '[browser] cached instance unhealthy; relaunching');
       browser = null;
     }
   }
@@ -113,10 +114,11 @@ export async function newPage(): Promise<Page> {
     const b = await getBrowser();
     const page = await b.newPage();
     await page.setBypassCSP(true);
+    logger.debug('[browser] new page created');
     return page;
   } catch (err) {
     // One-shot retry: relaunch & try again
-    logger.warn({ err }, 'newPage() failed — relaunching browser and retrying once');
+    logger.warn({ err }, '[browser] newPage() failed — relaunching and retrying once');
     try {
       browser?.removeAllListeners?.();
       await browser?.close?.();
@@ -125,6 +127,7 @@ export async function newPage(): Promise<Page> {
     const b = await getBrowser();
     const page = await b.newPage();
     await page.setBypassCSP(true);
+    logger.debug('[browser] new page created after relaunch');
     return page;
   }
 }
@@ -135,12 +138,8 @@ export async function enforceRateLimit() {
   const delay = Number.isFinite(env.REQUEST_DELAY_MS) ? env.REQUEST_DELAY_MS : 45000;
   if (elapsed < delay) {
     const wait = delay - elapsed;
-    logger.info({ waitMs: wait }, 'Rate limiting: waiting…');
+    logger.info({ waitMs: wait }, '[browser] rate limiting: waiting…');
     await new Promise((r) => setTimeout(r, wait));
   }
   lastRequestTime = Date.now();
 }
-
-process.on('exit', async () => {
-  try { await browser?.close(); } catch { /* noop */ }
-});

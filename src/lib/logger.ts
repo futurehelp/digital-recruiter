@@ -1,20 +1,20 @@
 import pino from 'pino';
+import { env } from './env';
 
-const isProd = process.env.NODE_ENV === 'production';
+const isProd = env.NODE_ENV === 'production';
 
 export const logger = pino({
-  level: isProd ? 'info' : 'debug',
-  // Pretty transport for local dev only; in prod, ship JSON to stdout
+  level: env.LOG_LEVEL,
+  base: undefined, // cleaner logs: no pid/hostname
   transport: isProd
-    ? undefined
+    ? undefined // JSON logs in prod (Railway)
     : {
         target: 'pino-pretty',
         options: {
           colorize: true,
           translateTime: 'SYS:standard',
           singleLine: false,
-          ignore: 'pid,hostname' // keep logs clean in dev
+          ignore: 'pid,hostname'
         }
-      },
-  base: undefined // omit pid/hostname base fields
+      }
 });

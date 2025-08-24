@@ -13,17 +13,20 @@ const EnvSchema = z.object({
   // Browser toggles
   PUPPETEER_HEADLESS: z.string().default('true'),
   PUPPETEER_EXECUTABLE_PATH: z.string().optional(),
-  HEADFUL: z
-    .string()
-    .default('false')
-    .transform((v) => v === 'true'),
+  HEADFUL: z.string().default('false').transform((v) => v === 'true'),
   CHROME_USER_DATA_DIR: z.string().default('/tmp/chrome-data'),
+  STARTUP_BROWSER_CHECK: z.string().default('true').transform((v) => v === 'true'),
 
   // Timeouts / pacing
   REQUEST_DELAY_MS: z.coerce.number().default(45000),
   PAGE_TIMEOUT_MS: z.coerce.number().default(60000),
   LOGIN_TIMEOUT_MS: z.coerce.number().default(90000),
-  ELEMENT_TIMEOUT_MS: z.coerce.number().default(30000)
+  ELEMENT_TIMEOUT_MS: z.coerce.number().default(30000),
+
+  // Logging
+  LOG_LEVEL: z
+    .enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent'])
+    .default('info')
 });
 
 export const env = EnvSchema.parse(process.env);
