@@ -1,4 +1,4 @@
-import axios from 'axios';
+import axios, { AxiosError } from 'axios';
 import { env } from '../lib/env';
 import { logger } from '../lib/logger';
 
@@ -37,7 +37,7 @@ function useMock(): boolean {
 function detectKind(
   prompt: string
 ): 'profile' | 'company' | 'role' | 'generic' {
-  const p = prompt.toLowerCase();
+  const p = (prompt || '').toLowerCase();
   if (
     p.includes('analyze company') ||
     p.includes('"industry"') ||
@@ -134,14 +134,14 @@ function buildMessages(userPrompt: string) {
   const kind = detectKind(userPrompt);
 
   const SYSTEM_PROMPT = `
-You are a **Senior Recruiter & Talent Intelligence Partner** with 15+ years of full‑cycle recruiting experience across software engineering, data, and product roles. 
-You specialize in evidence‑based evaluation, bias‑aware scoring, and concise decision‑ready reporting.
+You are a **Senior Recruiter & Talent Intelligence Partner** with 15+ years of full-cycle recruiting experience across software engineering, data, and product roles. 
+You specialize in evidence-based evaluation, bias-aware scoring, and concise decision-ready reporting.
 
 PRINCIPLES
 - Evidence over speculation. If information is insufficient, prefer nulls and list what's missing.
 - Calibration: all 1–10 scales must be used consistently (5 = average market baseline; 9–10 are reserved for truly exceptional signals).
 - Fairness: never infer protected characteristics; do not use demographic proxies (name, location, school prestige) to inflate/deflate scores.
-- Practicality: highlight signals that are predictive of on‑the‑job success (impact, scope, complexity, consistency).
+- Practicality: highlight signals that are predictive of on-the-job success (impact, scope, complexity, consistency).
 - Brevity with substance: outputs are compact but actionable; avoid fluff.
 
 OUTPUT CONTRACT (HARD REQUIREMENTS)
@@ -155,7 +155,7 @@ RUBRICS & SCALES
 - Reputation/Stability/Innovation/Overall (company): 1–10 where 5 = typical peer; 7–8 = strong; 9–10 = top decile.
 - Role scoring: impact = measurable outcomes & ownership; scope = breadth/leadership/stakeholders; complexity = technical or operational difficulty.
 - Profile scoring (when asked): weigh recency, impact, scope, and skill-market fit. Penalize vague or unverifiable claims.
-- Recommendations: must be concrete, observable next steps (e.g., "publish post‑mortem with KPIs"), not platitudes.
+- Recommendations: must be concrete, observable next steps (e.g., "publish post-mortem with KPIs"), not platitudes.
 
 ERROR HANDLING
 - If the task conflicts with the schema, prioritize the schema inferred for the task.
@@ -184,7 +184,7 @@ BEGIN NOW. RETURN JSON ONLY.
 }
 
 function tryParseJson(raw: string): any | null {
-  const trimmed = raw.trim();
+  const trimmed = (raw || '').trim();
   try {
     return JSON.parse(trimmed);
   } catch {
@@ -212,17 +212,28 @@ function tryParseJson(raw: string): any | null {
 }
 
 export async function analyzeWithAI(prompt: string): Promise<AIResult> {
-  if (useMock()) return DEFAULT_MOCK;
+  if (useMock()) {
+    logger.warn(
+      { reason: !env.OPENAI_API_KEY ? 'OPENAI_API_KEY missing' : 'FORCE_MOCK_AI=true' },
+      '[openai] Using DEFAULT_MOCK'
+    );
+    return DEFAULT_MOCK;
+  }
+
+  const model = env.OPENAI_MODEL || 'gpt-4o'; // ← configurable via Railway; defaults to gpt-4o
+  const apiUrl = 'https://api.openai.com/v1';
+  const timeoutMs = 30000;
 
   try {
     const messages = buildMessages(prompt);
+    logger.info({ model, timeoutMs, msgCount: messages.length }, '[openai] chat.completions request');
 
     const resp = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
+      `${apiUrl}/chat/completions`,
       {
-        model: 'gpt-4o-mini',
+        model,
         temperature: 0.2,
-        response_format: { type: 'json_object' },
+        // Note: some REST paths reject response_format; rely on prompt discipline instead.
         messages
       },
       {
@@ -230,20 +241,35 @@ export async function analyzeWithAI(prompt: string): Promise<AIResult> {
           Authorization: `Bearer ${env.OPENAI_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: 30000
+        timeout: timeoutMs,
+        proxy: false
       }
     );
 
     const raw = (resp.data?.choices?.[0]?.message?.content ?? '').trim();
     const parsed = tryParseJson(raw);
     if (parsed && typeof parsed === 'object') {
+      logger.debug('[openai] Parsed JSON OK');
       return parsed;
     }
 
-    logger.warn({ raw }, 'AI returned non-JSON; falling back to mock');
+    logger.warn({ rawPreview: raw.slice(0, 200) }, '[openai] Non-JSON response; using DEFAULT_MOCK');
     return DEFAULT_MOCK;
-  } catch (err) {
-    logger.error({ err }, 'OpenAI call failed; falling back to mock');
+  } catch (err: any) {
+    if (axios.isAxiosError(err)) {
+      const ax = err as AxiosError;
+      logger.error(
+        {
+          message: ax.message,
+          status: ax.response?.status,
+          data: ax.response?.data,
+          code: ax.code
+        },
+        '[openai] API error'
+      );
+    } else {
+      logger.error({ err: String(err) }, '[openai] Unexpected error');
+    }
     return DEFAULT_MOCK;
   }
 }
