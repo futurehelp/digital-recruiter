@@ -5,6 +5,7 @@ FROM node:20-bookworm-slim AS deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     xvfb \
+    xauth \
     ca-certificates \
     fonts-liberation \
     libasound2 \
@@ -41,7 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# We use system chromium; skip downloading a bundled one
+# We use system Chromium; skip downloading a bundled one
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 
 COPY package*.json ./
@@ -62,7 +63,7 @@ ENV NODE_ENV=production \
     # Default to headless; set HEADFUL=true to run via Xvfb
     PUPPETEER_HEADLESS=true \
     HEADFUL=false \
-    # Ephemeral user data dir (helps reduce some headless heuristics)
+    # Ephemeral user profile dir (helps reduce some automation fingerprints)
     CHROME_USER_DATA_DIR=/tmp/chrome-data
 
 # Copy built output and re-prune dev deps
