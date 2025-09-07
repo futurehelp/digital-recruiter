@@ -1,8 +1,10 @@
+// src/services/linkedinScraper.ts
 import type { Page } from 'puppeteer';
 import { env } from '../lib/env';
 import { logger } from '../lib/logger';
 import { enforceRateLimit, newPage, limiter } from '../lib/browser';
 import { LinkedInProfile } from '../types';
+import { loadSession, saveSession } from '../lib/session';
 
 async function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
@@ -32,12 +34,36 @@ async function scrollToBottom(page: Page, step = 250, pause = 120) {
   );
 }
 
+/**
+ * Try session cookies first. If invalid or missing, do fresh login.
+ */
 export async function authenticateLinkedIn(): Promise<Page> {
+  const page = await newPage();
+
+  // 1) Try session first
+  try {
+    const loaded = await loadSession(page);
+    if (loaded) {
+      await page.goto('https://www.linkedin.com/feed/', {
+        waitUntil: 'domcontentloaded',
+        timeout: env.PAGE_TIMEOUT_MS
+      });
+      const url = page.url();
+      logger.info({ url }, '[li] session check /feed');
+      if (!/\/login|\/checkpoint|\/challenge/.test(url)) {
+        logger.info('[li] ✅ Authenticated via saved session');
+        return page;
+      }
+      logger.warn('[li] saved session invalid, need fresh login');
+    }
+  } catch (err) {
+    logger.warn({ err }, '[li] no valid session; will fresh login');
+  }
+
+  // 2) Fresh login
   if (!env.LINKEDIN_EMAIL || !env.LINKEDIN_PASSWORD) {
     throw new Error('LinkedIn credentials required in environment variables');
   }
-
-  const page = await newPage();
 
   logger.info('[li] goto login');
   await page.goto('https://www.linkedin.com/login', {
@@ -63,33 +89,37 @@ export async function authenticateLinkedIn(): Promise<Page> {
   logger.debug('[li] submitting form');
   await page.click('button[type="submit"]');
 
-  try {
-    logger.debug('[li] waiting post-submit navigation');
-    await page.waitForNavigation({
-      waitUntil: 'domcontentloaded',
-      timeout: env.LOGIN_TIMEOUT_MS
-    });
-  } catch {
-    logger.warn('[li] no navigation event after submit; inspecting current URL');
+  // Poll for redirect
+  const start = Date.now();
+  while (Date.now() - start < env.LOGIN_TIMEOUT_MS) {
+    await sleep(1000);
+    const cur = page.url();
+    if (!cur.includes('/login')) break;
   }
 
   const currentUrl = page.url();
   logger.info({ currentUrl }, '[li] post-login URL');
   if (currentUrl.includes('/checkpoint') || currentUrl.includes('/challenge')) {
     logger.warn('[li] checkpoint/challenge detected');
-    await sleep(2000);
   }
 
   if (!currentUrl.includes('/login')) {
     logger.info('[li] authenticated (fresh login)');
+    await saveSession(page); // ✅ save new cookies for reuse
     return page;
   }
 
   const bodyText = await page.$eval('body', (b) => b.innerText).catch(() => '');
-  logger.error({ currentUrl, bodySnippet: bodyText?.slice(0, 200) || '' }, '[li] authentication failed');
+  logger.error(
+    { currentUrl, bodySnippet: bodyText?.slice(0, 200) || '' },
+    '[li] authentication failed'
+  );
   throw new Error('Authentication failed at LinkedIn login');
 }
 
+/**
+ * Scrape full profile data, preferring the /details/experience/ page for work history.
+ */
 export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
   await enforceRateLimit();
 
@@ -99,131 +129,83 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
     logger.info({ profileUrl }, '[li] begin scrape');
     page = await authenticateLinkedIn();
 
-    logger.info('[li] goto profile URL');
+    // Construct details URL for experience
+    const detailsUrl = `${profileUrl.replace(/\/$/, '')}/details/experience/`;
+    logger.info({ detailsUrl }, '[li] goto details/experience page');
+    await page.goto(detailsUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: env.PAGE_TIMEOUT_MS
+    });
+
+    // Wait for job entries
+    await page.waitForSelector('.optional-action-target-wrapper', {
+      timeout: env.ELEMENT_TIMEOUT_MS
+    });
+
+    await sleep(2000);
+    await scrollToBottom(page);
+    await sleep(1000);
+
+    logger.debug('[li] extracting work history from details page');
+    const workHistory = await page.evaluate(() => {
+      const clean = (t?: string | null) => (t || '').replace(/\s+/g, ' ').trim();
+
+      return Array.from(document.querySelectorAll('li')).map((li) => {
+        const position = clean(li.querySelector('.t-bold')?.textContent);
+        const company = clean(
+          li.querySelector('.t-14.t-normal')?.textContent ||
+            li.querySelector('.t-normal span')?.textContent
+        );
+        const duration = clean(
+          li.querySelector('.t-14.t-black--light')?.textContent ||
+            li.querySelector('.t-14.t-normal.t-black--light')?.textContent
+        );
+        const description = clean(
+          li.querySelector('.pv-shared-text-with-see-more')?.textContent ||
+            li.querySelector('.inline-show-more-text')?.textContent
+        );
+
+        if (position || company) {
+          return {
+            position,
+            company,
+            duration,
+            description
+          };
+        }
+        return null;
+      }).filter(Boolean);
+    });
+
+    // Basic profile info still comes from main page
+    logger.info('[li] back to main profile for summary');
     await page.goto(profileUrl, {
       waitUntil: 'domcontentloaded',
       timeout: env.PAGE_TIMEOUT_MS
     });
 
-    logger.debug('[li] wait for profile heading');
-    await page.waitForSelector('h1, .text-heading-xlarge', {
-      timeout: env.ELEMENT_TIMEOUT_MS
-    });
-
-    logger.debug('[li] initial settle + scroll');
-    await sleep(2500);
-    await scrollToBottom(page);
-    await sleep(1200);
-
-    logger.debug('[li] extracting profile data');
-    const data = await page.evaluate(() => {
-      const clean = (t?: string | null) =>
-        (t || '').replace(/\s+/g, ' ').replace(/(.+?)\1+/g, '$1').trim();
-      const section = (id: string) =>
-        document.querySelector(`#${CSS.escape(id)}`)?.closest('section');
-      function extractStart(duration: string): string {
-        const m = duration.match(/([A-Za-z]{3,9}\s+\d{4})/);
-        return m ? m[1] : '';
-      }
-      function extractEnd(duration: string): string {
-        if (/present/i.test(duration)) return 'present';
-        const ms = duration.match(/([A-Za-z]{3,9}\s+\d{4})/g);
-        return ms && ms.length > 1 ? ms[1] : 'present';
-      }
-
-      const profile: any = {
+    const basics = await page.evaluate(() => {
+      const clean = (t?: string | null) => (t || '').replace(/\s+/g, ' ').trim();
+      return {
         name: clean(document.querySelector('.text-heading-xlarge, h1')?.textContent),
-        title: clean(
-          document.querySelector('.text-body-medium.break-words')?.textContent ||
-          document.querySelector('.pv-text-details__left-panel .text-body-medium')?.textContent
-        ),
-        location: clean(
-          document.querySelector('.text-body-small.inline.t-black--light.break-words')?.textContent ||
-          document.querySelector('.pv-text-details__left-panel .text-body-small')?.textContent
-        ),
-        summary: '',
-        workHistory: [] as any[],
-        education: [] as any[],
-        skills: [] as string[],
-        connections: '0'
+        title: clean(document.querySelector('.text-body-medium.break-words')?.textContent),
+        location: clean(document.querySelector('.text-body-small.inline')?.textContent),
+        summary: ''
       };
-
-      const aboutSection = section('about');
-      if (aboutSection) {
-        const content = aboutSection.querySelector('.display-flex')?.textContent;
-        profile.summary = clean(content);
-      }
-
-      const expSection = section('experience');
-      if (expSection) {
-        const items = expSection.querySelectorAll('li.artdeco-list__item');
-        items.forEach((li) => {
-          const position = clean(li.querySelector('.t-bold')?.textContent);
-          const company = clean(
-            li.querySelector('.t-14.t-normal')?.textContent ||
-            li.querySelector('.t-normal span')?.textContent
-          );
-          const duration = clean(
-            li.querySelector('.t-14.t-black--light')?.textContent ||
-            li.querySelector('.t-14.t-normal.t-black--light')?.textContent
-          );
-          const description = clean(
-            li.querySelector('.pv-shared-text-with-see-more')?.textContent ||
-            li.querySelector('.inline-show-more-text')?.textContent
-          );
-          if (position && company) {
-            const companyName = (company.split('·')[0] || company).trim();
-            profile.workHistory.push({
-              position,
-              company: companyName,
-              duration: duration || '',
-              description: description || '',
-              startDate: extractStart(duration || ''),
-              endDate: extractEnd(duration || '')
-            });
-          }
-        });
-      }
-
-      const skillsSection = section('skills');
-      if (skillsSection) {
-        const skillEls = skillsSection.querySelectorAll('span.t-bold');
-        skillEls.forEach((el) => {
-          const nm = clean(el.textContent);
-          if (nm && !profile.skills.includes(nm)) profile.skills.push(nm);
-        });
-      }
-
-      const eduSection = section('education');
-      if (eduSection) {
-        const items = eduSection.querySelectorAll('li.artdeco-list__item');
-        items.forEach((li) => {
-          const institution = clean(li.querySelector('.t-bold')?.textContent);
-          const degree = clean(li.querySelector('.t-14.t-normal')?.textContent);
-          if (institution) {
-            profile.education.push({
-              institution,
-              degree: degree || 'Degree not specified',
-              field: 'Field not specified'
-            });
-          }
-        });
-      }
-
-      const connectionsText = clean(document.body.textContent || '');
-      const connMatch = connectionsText.match(/(\d{3,4})\+?\s+connections/i);
-      profile.connections = connMatch ? connMatch[1] : '0';
-
-      return profile;
     });
 
-    logger.info({ name: data?.name || '(unknown)' }, '[li] scrape succeeded');
+    const data = { ...basics, workHistory, education: [], skills: [], connections: 0 };
+    logger.info({ name: data?.name || '(unknown)', jobs: workHistory.length }, '[li] scrape succeeded');
     return data;
   } catch (err) {
     logger.error({ err, profileUrl }, '[li] scrape failed — returning fallback');
     return fallbackProfile();
   } finally {
-    try { await page?.close(); } catch { /* ignore */ }
+    try {
+      await page?.close();
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -243,27 +225,9 @@ export function parseLinkedInProfile(rawData: any): LinkedInProfile {
       duration: x.duration || '',
       startDate: x.startDate || '',
       endDate: x.endDate || '',
-      description: x.description || '',
-      location: x.location
+      description: x.description || ''
     }));
-  const normalizeEdu = (items: any[]): any[] =>
-    (items || []).map((x) => ({
-      institution: x.institution || 'Unknown',
-      degree: x.degree || 'Degree not specified',
-      field: x.field || 'Field not specified',
-      startYear: x.startYear,
-      endYear: x.endYear
-    }));
-
   const connections = parseInt(rawData?.connections, 10) || 0;
-
-  let score = 0;
-  if (rawData?.name) score += 15;
-  if (rawData?.title) score += 15;
-  if (rawData?.summary && rawData.summary.length > 50) score += 20;
-  if (rawData?.workHistory && rawData.workHistory.length > 0) score += 25;
-  if (rawData?.education && rawData.education.length > 0) score += 10;
-  if (rawData?.skills && rawData.skills.length >= 3) score += 15;
 
   return {
     name: rawData?.name || 'Unknown',
@@ -271,10 +235,10 @@ export function parseLinkedInProfile(rawData: any): LinkedInProfile {
     location: rawData?.location || 'Unknown',
     summary: rawData?.summary || 'No summary available',
     workHistory: normalizeWork(rawData?.workHistory || []),
-    education: normalizeEdu(rawData?.education || []),
+    education: rawData?.education || [],
     skills: rawData?.skills || [],
     connections,
-    profileStrength: Math.min(score, 100)
+    profileStrength: Math.min((rawData?.workHistory?.length || 0) * 20 + 20, 100)
   };
 }
 
@@ -285,19 +249,10 @@ function fallbackProfile(): LinkedInProfile {
     location: 'Unknown',
     summary:
       'Fallback profile due to login/navigation issues. Ensure valid credentials and consider session reuse or slower pacing.',
-    workHistory: [
-      {
-        company: 'Tech Company',
-        position: 'Software Developer',
-        duration: '2+ years',
-        startDate: '2022',
-        endDate: 'present',
-        description: 'Full-stack development and system architecture'
-      }
-    ],
+    workHistory: [],
     education: [],
-    skills: ['JavaScript', 'TypeScript', 'React', 'Node.js', 'Python', 'AWS'],
-    connections: 500,
-    profileStrength: 78
+    skills: [],
+    connections: 0,
+    profileStrength: 50
   };
 }

@@ -220,7 +220,7 @@ export async function analyzeWithAI(prompt: string): Promise<AIResult> {
     return DEFAULT_MOCK;
   }
 
-  const model = env.OPENAI_MODEL || 'gpt-4o'; // ← configurable via Railway; defaults to gpt-4o
+  const model = env.OPENAI_MODEL || 'gpt-4o-mini'; // ← configurable via Railway; defaults to gpt-4o
   const apiUrl = 'https://api.openai.com/v1';
   const timeoutMs = 30000;
 

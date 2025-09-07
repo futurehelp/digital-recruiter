@@ -11,6 +11,8 @@ expo-env.d.ts
 /android/
 /ios/
 
+/demos
+
 # macOS
 .DS_Store
 

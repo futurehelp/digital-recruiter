@@ -22,7 +22,7 @@ function firstExisting(paths: Array<string | undefined>): string | undefined {
 }
 
 function resolveExecutablePath(): string | undefined {
-  const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  const envPath = env.PUPPETEER_EXECUTABLE_PATH;
   const chosenEnv = firstExisting([envPath]);
   if (chosenEnv) {
     logger.info({ executablePath: chosenEnv }, '[browser] using PUPPETEER_EXECUTABLE_PATH');
@@ -56,7 +56,9 @@ function resolveExecutablePath(): string | undefined {
 
 async function launchBrowser(): Promise<Browser> {
   const executablePath = resolveExecutablePath();
-  const headless = env.HEADFUL ? false : env.PUPPETEER_HEADLESS !== 'false';
+
+  // ✅ FIX: env.HEADFUL and env.PUPPETEER_HEADLESS are already booleans
+  const headless = env.HEADFUL ? false : env.PUPPETEER_HEADLESS;
 
   const args = [
     `--user-data-dir=${env.CHROME_USER_DATA_DIR}`,

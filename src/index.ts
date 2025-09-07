@@ -1,5 +1,5 @@
 import { createServer } from './server';
-import { env } from './lib/env';
+import { env, safeEnvSummary } from './lib/env';
 import { logger } from './lib/logger';
 import { getBrowser, newPage } from './lib/browser';
 
@@ -23,7 +23,10 @@ async function startupBrowserPreflight() {
 }
 
 async function main() {
-  // ultra-early logs even if logger misbehaves
+  // Early summary including which OpenAI model will be used
+  logger.info(safeEnvSummary(), '[startup] Environment summary');
+
+  // ultra-early stdout (helps when logger transport is misconfigured)
   // eslint-disable-next-line no-console
   console.log(
     JSON.stringify({
@@ -33,7 +36,7 @@ async function main() {
       port: env.PORT,
       headful: env.HEADFUL,
       headless: env.PUPPETEER_HEADLESS,
-      execPath: process.env.PUPPETEER_EXECUTABLE_PATH || '(auto)',
+      execPath: env.PUPPETEER_EXECUTABLE_PATH || '(auto)',
       userDataDir: env.CHROME_USER_DATA_DIR,
       logLevel: env.LOG_LEVEL
     })
@@ -48,9 +51,10 @@ async function main() {
         port: env.PORT,
         headful: env.HEADFUL,
         headless: env.PUPPETEER_HEADLESS,
-        execPath: process.env.PUPPETEER_EXECUTABLE_PATH || '(auto)',
+        execPath: env.PUPPETEER_EXECUTABLE_PATH || '(auto)',
         userDataDir: env.CHROME_USER_DATA_DIR,
-        logLevel: env.LOG_LEVEL
+        logLevel: env.LOG_LEVEL,
+        openaiModel: env.OPENAI_MODEL // 👈 also log the model here
       },
       '🚀 Backend listening'
     );
