@@ -5,12 +5,13 @@ import { logger } from '../lib/logger';
 import { enforceRateLimit, newPage, limiter } from '../lib/browser';
 import { LinkedInProfile } from '../types';
 import { loadSession, saveSession } from '../lib/session';
+import { warmPageForScrape, expandShowMore, killCookieBanners } from '../lib/pageReady';
 
 // ---------- small utils ----------
-const SLOW_MS = env.ELEMENT_TIMEOUT_MS ?? 45000;
-const PAGE_MS = env.PAGE_TIMEOUT_MS ?? 60000;
+const SLOW_MS = env.ELEMENT_TIMEOUT_MS ?? 45_000;
+const PAGE_MS = env.PAGE_TIMEOUT_MS ?? 60_000;
 
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const human = (min = 250, max = 700) => sleep(Math.floor(min + Math.random() * (max - min)));
 
 function clean(t?: string | null) {
@@ -42,26 +43,6 @@ async function debugDump(page: Page, tag: string) {
     logger.info({ pngPath: png, htmlPath: html }, '[debugDump] wrote ' + tag);
   } catch (err) {
     logger.error({ err }, '[debugDump] failed for ' + tag);
-  }
-}
-
-async function handleCookieBanner(page: Page) {
-  // Try a few common buttons LinkedIn shows in EMEA/US variants
-  const candidates = [
-    'button[aria-label="Accept"]',
-    'button:has(span:contains("Accept"))',
-    'button:has(span:contains("Agree"))',
-    'button[aria-label*="Accept all"]',
-  ];
-  for (const sel of candidates) {
-    try {
-      const found = await page.$(sel);
-      if (found) {
-        await found.click().catch(() => {});
-        await human(300, 600);
-        break;
-      }
-    } catch {/* ignore */}
   }
 }
 
@@ -123,23 +104,13 @@ export async function authenticateLinkedIn(): Promise<Page> {
 // ---------- scraping helpers ----------
 /** Robust experience extractor for the /details/experience page. */
 async function extractExperienceFromDetails(page: Page) {
-  // Wait for the variant you showed: li.pvs-list__paged-list-item
+  // Page has already been warmed & scrolled; still wait briefly for list items
   await page.waitForSelector('li.pvs-list__paged-list-item', { timeout: SLOW_MS }).catch(() => {});
-  await handleCookieBanner(page);
-  // Slow scroll to ensure lazy items render
-  await page.evaluate(async () => {
-    const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
-    for (let i = 0; i < 8; i++) {
-      window.scrollBy(0, 1000);
-      await pause(400);
-    }
-  }).catch(() => {});
-  await human(500, 900);
+  await killCookieBanners(page);
 
   const items = await page.evaluate(() => {
     const clean = (t?: string | null) => (t || '').replace(/\s+/g, ' ').trim();
 
-    // Helper: pick first non-empty string from an array of selectors
     function pick(el: Element, selectors: string[]): string {
       for (const s of selectors) {
         const n = el.querySelector<HTMLElement>(s);
@@ -151,51 +122,55 @@ async function extractExperienceFromDetails(page: Page) {
       return '';
     }
 
-    // Heuristic fallback: get a few visible lines under the main text container
-    function heuristicLines(container: Element): string[] {
-      const spans = Array.from(container.querySelectorAll('span'))
-        .map(s => clean((s as HTMLElement).innerText || s.textContent || ''))
-        .filter(Boolean);
-      // Deduplicate while preserving order
-      return Array.from(new Set(spans)).slice(0, 6);
+    function hasTimeDescendant(span: Element): boolean {
+      if (!span) return false;
+      return !!span.querySelector('time');
     }
 
-    return Array.from(document.querySelectorAll('li.pvs-list__paged-list-item')).map(li => {
-      // Primary text container (your screenshot variant):
+    function heuristicLines(container: Element): string[] {
+      const spans = Array.from(container.querySelectorAll('span'))
+        .map((s) => clean((s as HTMLElement).innerText || s.textContent || ''))
+        .filter(Boolean);
+      return Array.from(new Set(spans)).slice(0, 8);
+    }
+
+    function firstSpanWithTimeText(el: Element): string {
+      const spans = Array.from(el.querySelectorAll('span'));
+      for (const span of spans) {
+        if (hasTimeDescendant(span)) {
+          const t = clean((span as HTMLElement).innerText || span.textContent || '');
+          if (t) return t;
+        }
+      }
+      return '';
+    }
+
+    return Array.from(document.querySelectorAll('li.pvs-list__paged-list-item')).map((li) => {
       const main =
         li.querySelector<HTMLElement>('div.display-flex.flex-column.align-self-center.flex-grow-1') ||
-        li.querySelector<HTMLElement>('div.pvs-entity');
+        li.querySelector<HTMLElement>('div.pvs-entity') ||
+        li;
 
-      if (!main) {
-        // Fallback: treat the <li> itself as container
-        const lines = heuristicLines(li);
-        const [position = '', company = '', duration = ''] = lines;
-        return { position, company, duration, description: '' };
-      }
-
-      // Try concrete patterns first (A/B variants)
+      // Position
       const position =
         pick(main, [
           '.mr1.hoverable-link-text.t-bold span',
-          'span[aria-hidden="true"]',
           '.t-bold',
-          'a[aria-hidden="true"] span',
+          'a[aria-hidden="true"] span'
         ]) || heuristicLines(main)[0] || '';
 
+      // Company
       const company =
         pick(main, [
           '.t-14.t-normal',
           '.pv-entity__secondary-title',
-          'a[href*="/company/"] span[aria-hidden="true"]',
+          'a[href*="/company/"] span[aria-hidden="true"]'
         ]) || heuristicLines(main)[1] || '';
 
+      // Duration / dates: try explicit time spans, else heuristic line containing date-ish text
       const duration =
-        pick(main, [
-          '.t-14.t-normal.t-black--light',
-          '.pv-entity__date-range span:nth-child(2)',
-          'span:has(time)'
-        ]) ||
-        (heuristicLines(main).find(t => /·|month|year|Present|20\d{2}/i.test(t)) || '');
+        firstSpanWithTimeText(main) ||
+        (heuristicLines(main).find((t) => /·|month|year|present|20\d{2}/i.test(t)) || '');
 
       const description =
         pick(li, [
@@ -205,22 +180,30 @@ async function extractExperienceFromDetails(page: Page) {
         ]);
 
       return { position, company, duration, description };
-    }).filter(x => x.position || x.company);
+    }).filter((x) => x.position || x.company);
   });
 
-  return items;
+  return items as Array<{
+    position: string;
+    company: string;
+    duration: string;
+    description: string;
+  }>;
 }
 
 async function extractBasicsFromMain(page: Page) {
-  await handleCookieBanner(page);
-  await page.waitForSelector('.pv-text-details__left-panel, .mt2', { timeout: SLOW_MS }).catch(() => {});
+  await killCookieBanners(page);
+  await page.waitForSelector('.pv-text-details__left-panel, .mt2, h1', { timeout: SLOW_MS }).catch(() => {});
   return await page.evaluate(() => {
     const clean = (t?: string | null) => (t || '').replace(/\s+/g, ' ').trim();
     const name =
       clean(document.querySelector('.text-heading-xlarge, h1')?.textContent) ||
       clean(document.querySelector('h1')?.textContent);
     const title = clean(document.querySelector('.text-body-medium.break-words')?.textContent);
-    const location = clean(document.querySelector('.text-body-small.inline, [data-test-location]')?.textContent);
+    const locNode =
+      document.querySelector('.text-body-small.inline') ||
+      document.querySelector('[data-test-location]');
+    const location = clean(locNode?.textContent);
     return { name, title, location, summary: '' };
   });
 }
@@ -235,10 +218,11 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
     logger.info({ profileUrl }, '[li] begin scrape');
     page = await authenticateLinkedIn();
 
-    // DETAILS page (experience)
+    // DETAILS page (experience) — use warmup + expand for reliability on EC2
     const detailsUrl = `${profileUrl.replace(/\/$/, '')}/details/experience/`;
     logger.info({ detailsUrl }, '[li] goto details/experience page');
-    await safeGoto(page, detailsUrl, 'details-experience');
+    await warmPageForScrape(page, detailsUrl, 'details-experience');
+    await expandShowMore(page);
     await debugDump(page, 'after-details');
 
     const workHistory = await extractExperienceFromDetails(page).catch(() => []);
@@ -246,7 +230,7 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
 
     // MAIN profile (basics)
     logger.info('[li] back to main profile for summary');
-    await safeGoto(page, profileUrl, 'main-profile');
+    await warmPageForScrape(page, profileUrl, 'main-profile');
     await debugDump(page, 'after-main');
 
     const basics = await extractBasicsFromMain(page);

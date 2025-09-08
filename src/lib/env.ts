@@ -53,7 +53,7 @@ const EnvSchema = z.object({
   PROXY_SERVER: z.string().optional(), // e.g. "http://gate.decodo.com:10001"
   PROXY_USERNAME: z.string().optional(),
   PROXY_PASSWORD: z.string().optional(),
-  PROXY_BYPASS: z.string().default('localhost,127.0.0.1') // comma-separated
+  PROXY_BYPASS: z.string().default('localhost,127.0.0.1')
 });
 
 export const env = EnvSchema.parse(process.env);

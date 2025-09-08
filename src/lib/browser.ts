@@ -1,3 +1,4 @@
+// src/lib/browser.ts
 import path from 'path';
 import fs, { existsSync } from 'fs';
 import os from 'os';
@@ -91,6 +92,19 @@ function unlockChromeProfile(userDataDir: string) {
   }
 }
 
+/** Build a **Linux** desktop UA that matches the *actual* Chrome major version. */
+async function computeLinuxUA(b: Browser): Promise<string> {
+  // e.g. "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)
+  //  Chrome/126.0.0.0 Safari/537.36"
+  let major = 120;
+  try {
+    const v = await b.version(); // "HeadlessChrome/126.0.6478.126" or "Chrome/126.0..."
+    const m = v.match(/Chrome\/(\d+)/i);
+    if (m) major = parseInt(m[1], 10);
+  } catch { /* ignore */ }
+  return `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+}
+
 /* ───────────────────────── browser lifecycle ───────────────────────── */
 async function innerLaunch(): Promise<Browser> {
   const executablePath = resolveExecutablePath();
@@ -113,40 +127,42 @@ async function innerLaunch(): Promise<Browser> {
   // proactively clear stale singleton locks
   unlockChromeProfile(userDataDir);
 
+  // IMPORTANT: remove suspicious flags that trip LI bot controls
   const args = [
     `--user-data-dir=${userDataDir}`,
     '--profile-directory=Default',
     '--no-sandbox',
     '--disable-setuid-sandbox',
     '--disable-dev-shm-usage',
-    '--disable-gpu',                           // GPU off under Xvfb
-    '--disable-web-security',
-    '--window-size=1366,768',
+    '--disable-gpu', // under Xvfb
+    '--window-size=1366,900',
     '--lang=en-US,en',
     '--disable-blink-features=AutomationControlled',
-    '--disable-features=IsolateOrigins,site-per-process',
+    // Less suspicious than disabling site isolation entirely:
+    // (omit --disable-features=IsolateOrigins,site-per-process)
     '--password-store=basic',
     '--enable-features=NetworkService,NetworkServiceInProcess',
-    '--remote-debugging-port=9222',
+    // DO NOT expose remote debugging in production; LI can detect it.
+    // (omit --remote-debugging-port)
     '--autoplay-policy=no-user-gesture-required',
     '--no-first-run',
     '--no-default-browser-check'
+    // (omit --disable-web-security)
   ];
 
   // Proxy support (Decodo)
   if (env.PROXY_ENABLED && env.PROXY_SERVER) {
     args.push(`--proxy-server=${env.PROXY_SERVER}`);
     if (env.PROXY_BYPASS?.trim()) {
-      // Note: this flag is Chromium compatible; values are comma-separated hosts.
       args.push(`--proxy-bypass-list=${env.PROXY_BYPASS}`);
     }
   }
 
   const opts: PuppeteerLaunchOptions = {
-    headless, // will be false on EC2 if HEADFUL=true
+    headless,
     executablePath,
     args,
-    defaultViewport: { width: 1366, height: 768 },
+    defaultViewport: { width: 1366, height: 900, deviceScaleFactor: 1 },
     protocolTimeout: Math.max(Number(env.PAGE_TIMEOUT_MS) || 0, 120_000)
   };
 
@@ -177,6 +193,7 @@ async function innerLaunch(): Promise<Browser> {
 
   const version = await b.version().catch(() => 'unknown');
   logger.info({ version }, '[browser] launched');
+
   return b;
 }
 
@@ -185,7 +202,6 @@ async function launchBrowser(): Promise<Browser> {
     return await innerLaunch();
   } catch (err: any) {
     const msg = String(err?.message || err);
-    // Retry once if profile lock error
     if (/profile appears to be in use/i.test(msg)) {
       logger.warn({ err }, '[browser] launch failed due to profile lock — unlocking & retrying once');
       try {
@@ -244,27 +260,28 @@ export async function newPage(): Promise<Page> {
       page.setDefaultTimeout(Number(env.ELEMENT_TIMEOUT_MS) || 45_000);
     } catch { /* ignore */ }
 
-    // Desktop fingerprint (stable UA helps)
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-        '(KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36'
-    );
-    await page.setViewport({ width: 1366, height: 768, deviceScaleFactor: 1 });
+    // Build a Linux UA that matches the actual Chrome version
+    const linuxUA = await computeLinuxUA(b);
+    await page.setUserAgent(linuxUA);
+
+    await page.setViewport({ width: 1366, height: 900, deviceScaleFactor: 1 });
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
     await page.setBypassCSP(true);
 
-    // Add a few “real browser” signals before any site JS executes
+    // Stealth hardening: align platform/capabilities to Linux desktop
     await page.evaluateOnNewDocument(() => {
       try {
-        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+        Object.defineProperty(navigator, 'platform', { get: () => 'Linux x86_64' });
         Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
         Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+
+        // Plugins presence (common on Linux Chrome)
         Object.defineProperty(navigator, 'plugins', {
           get: () =>
             [
-              { name: 'Chrome PDF Plugin' },
-              { name: 'Chrome PDF Viewer' },
+              { name: 'Chromium PDF Plugin' },
+              { name: 'Chromium PDF Viewer' },
               { name: 'Native Client' }
             ] as any
         });
@@ -273,11 +290,11 @@ export async function newPage(): Promise<Page> {
         const getParameter = WebGLRenderingContext.prototype.getParameter;
         WebGLRenderingContext.prototype.getParameter = function (param) {
           if (param === 37445) return 'Google Inc.'; // UNMASKED_VENDOR_WEBGL
-          if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce, Direct3D11)';
+          if (param === 37446) return 'ANGLE (AMD, AMD Radeon, OpenGL)'; // generic Linux-y
           return getParameter.call(this, param);
         };
 
-        // Normalize timezone (optional)
+        // Normalize timezone (choose one; US timezones tend to look less botty than UTC)
         try {
           // @ts-ignore
           Intl.DateTimeFormat = class extends Intl.DateTimeFormat {
