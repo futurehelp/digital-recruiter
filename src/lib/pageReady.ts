@@ -90,7 +90,7 @@ export async function killCookieBanners(page: Page) {
 }
 
 /** Scroll entire page for up to 10 minutes */
-export async function autoScroll(page: Page, maxMs = 600_000) {
+export async function autoScroll(page: Page, maxMs = 10_000) {
   const start = Date.now();
   let lastHeight = (await page.evaluate(() => document.body.scrollHeight)) as number;
   if (!Number.isFinite(lastHeight)) lastHeight = 0;
