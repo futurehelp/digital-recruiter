@@ -1,166 +1,75 @@
-import type { Page, ElementHandle } from 'puppeteer';
+// src/services/linkedinScraper.ts
+import type { Page } from 'puppeteer';
 import { env } from '../lib/env';
 import { logger } from '../lib/logger';
 import { enforceRateLimit, newPage, limiter } from '../lib/browser';
 import { LinkedInProfile } from '../types';
 import { loadSession, saveSession } from '../lib/session';
-import fs from 'fs';
-import path from 'path';
 
-/* ------------------------ tiny utils ------------------------ */
-const DUMP_DIR = '/home/ubuntu';
-function nowMs() {
-  return Date.now();
-}
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-async function humanDelay(min = 200, max = 650) {
-  const ms = Math.floor(min + Math.random() * (max - min));
-  return sleep(ms);
-}
-function fileSafe(label: string) {
-  return label.replace(/[^a-z0-9-_]/gi, '_').slice(0, 80);
+// ---------- small utils ----------
+const SLOW_MS = env.ELEMENT_TIMEOUT_MS ?? 45000;
+const PAGE_MS = env.PAGE_TIMEOUT_MS ?? 60000;
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+const human = (min = 250, max = 700) => sleep(Math.floor(min + Math.random() * (max - min)));
+
+function clean(t?: string | null) {
+  return (t || '').replace(/\s+/g, ' ').trim();
 }
 
-/* ------------------------ navigation helpers ------------------------ */
-async function waitForNetworkIdleLoose(page: Page, timeout = 10000) {
-  // Puppeteer has page.waitForNetworkIdle in newer versions; fall back to domcontentloaded cycle
+async function safeGoto(page: Page, url: string, label: string) {
+  const t0 = Date.now();
   try {
-    // @ts-ignore - available in recent puppeteer
-    if (typeof (page as any).waitForNetworkIdle === 'function') {
-      await (page as any).waitForNetworkIdle({ timeout });
-      return;
-    }
-  } catch {}
-  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout }).catch(() => {});
-}
-
-async function safeGoto(page: Page, url: string, label?: string) {
-  const start = nowMs();
-  const nav = page.goto(url, {
-    waitUntil: 'domcontentloaded',
-    timeout: env.PAGE_TIMEOUT_MS
-  });
-
-  // Race goto + a secondary "idle" wait so we don't evaluate during navigation
-  await Promise.race([
-    nav,
-    (async () => {
-      // backstop if goto resolves instantly
-      await sleep(250);
-    })()
-  ]).catch(() => {});
-
-  // A second barrier for network quietness
-  await waitForNetworkIdleLoose(page, Math.min(15000, (env.PAGE_TIMEOUT_MS || 60000) / 4));
-
-  const took = nowMs() - start;
-  logger.debug({ url, tookMs: took, label }, '[nav] safeGoto settled');
-}
-
-/* ------------------------ debug dump (resilient) ------------------------ */
-async function debugDump(page: Page, label: string) {
-  const ts = nowMs();
-  const base = `${fileSafe(label)}-${ts}`;
-  const pngPath = path.join(DUMP_DIR, `debug-${base}.png`);
-  const htmlPath = path.join(DUMP_DIR, `debug-${base}.html`);
-
-  try {
-    // Give nav a moment to settle to avoid exec-context-destroyed
-    await sleep(150);
-    await page.screenshot({ path: pngPath, fullPage: true }).catch(() => {});
-    let html = '';
-    for (let i = 0; i < 3; i++) {
-      try {
-        html = await page.evaluate(() => document.documentElement.outerHTML);
-        break;
-      } catch {
-        await sleep(200);
-      }
-    }
-    if (html) {
-      fs.writeFileSync(htmlPath, html, 'utf8');
-      logger.info({ pngPath, htmlPath }, '[debugDump] wrote ' + label);
-    } else {
-      logger.info({ pngPath }, '[debugDump] wrote screenshot only (HTML unavailable)');
-    }
-  } catch (err: any) {
-    logger.error({ err }, `[debugDump] failed for ${label}`);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PAGE_MS });
+  } catch (err) {
+    logger.warn({ err, url }, '[nav] goto error; continuing');
+  } finally {
+    logger.debug({ url, tookMs: Date.now() - t0, label }, '[nav] safeGoto settled');
   }
 }
 
-/* ------------------------ DOM helpers ------------------------ */
-async function clickByText(page: Page, tag: string, substrings: string[]) {
-  const lc = substrings.map((s) => s.toLowerCase());
-  const handle = await page.evaluateHandle(
-    ({ tag, lc }) => {
-      const nodes = Array.from(document.querySelectorAll(tag));
-      return nodes.find((el) => {
-        const t = (el.textContent || '').trim().toLowerCase();
-        return lc.some((s) => t.includes(s));
-      }) || null;
-    },
-    { tag, lc }
-  );
-  const el = handle.asElement();
-  if (el) {
-    // Cast to Element handle for TS
-    await (el as unknown as ElementHandle<Element>).click({ delay: 50 }).catch(() => {});
-    return true;
+async function debugDump(page: Page, tag: string) {
+  try {
+    const ts = Date.now();
+    const png = `/home/ubuntu/debug-${tag}-${ts}.png`;
+    const html = `/home/ubuntu/debug-${tag}-${ts}.html`;
+    await page.screenshot({ path: png, fullPage: true }).catch(() => {});
+    const content = await page.content().catch(() => '');
+    if (content) {
+      const fs = await import('fs');
+      fs.writeFileSync(html, content);
+    }
+    logger.info({ pngPath: png, htmlPath: html }, '[debugDump] wrote ' + tag);
+  } catch (err) {
+    logger.error({ err }, '[debugDump] failed for ' + tag);
   }
-  return false;
 }
 
 async function handleCookieBanner(page: Page) {
-  // Handle common consent banners via friendly heuristics
-  try {
-    const clicked =
-      (await clickByText(page, 'button', ['accept', 'agree', 'allow all'])) ||
-      (await clickByText(page, 'button', ['okay', 'ok'])) ||
-      (await clickByText(page, 'button', ['continue']));
-    if (clicked) {
-      await sleep(300);
-    }
-  } catch {
-    /* ignore */
+  // Try a few common buttons LinkedIn shows in EMEA/US variants
+  const candidates = [
+    'button[aria-label="Accept"]',
+    'button:has(span:contains("Accept"))',
+    'button:has(span:contains("Agree"))',
+    'button[aria-label*="Accept all"]',
+  ];
+  for (const sel of candidates) {
+    try {
+      const found = await page.$(sel);
+      if (found) {
+        await found.click().catch(() => {});
+        await human(300, 600);
+        break;
+      }
+    } catch {/* ignore */}
   }
 }
 
-async function scrollToBottom(page: Page, step = 500, pause = 200) {
-  await page.evaluate(
-    async ({ step, pause }) => {
-      await new Promise<void>((resolve) => {
-        let lastY = 0;
-        const id = setInterval(() => {
-          window.scrollBy(0, step);
-          if (window.scrollY === lastY) {
-            clearInterval(id);
-            resolve();
-            return;
-          }
-          lastY = window.scrollY;
-        }, pause);
-      });
-    },
-    { step, pause }
-  );
-}
-
-/* ------------------------ auth + session ------------------------ */
-async function postLoginCheckpointHandling(page: Page) {
-  const url = page.url();
-  if (/\/checkpoint|\/challenge/.test(url)) {
-    logger.warn('[li] checkpoint/challenge detected');
-    await debugDump(page, 'checkpoint');
-    // Let human solve via DevTools tunnel if needed; we proceed optimistically.
-  }
-}
-
+// ---------- auth ----------
 export async function authenticateLinkedIn(): Promise<Page> {
   const page = await newPage();
 
-  // 1) Try session first
+  // Try saved session first
   try {
     const loaded = await loadSession(page);
     if (loaded) {
@@ -177,120 +86,146 @@ export async function authenticateLinkedIn(): Promise<Page> {
     logger.warn({ err }, '[li] no valid session; will fresh login');
   }
 
-  // 2) Fresh login
+  // Fresh login
   if (!env.LINKEDIN_EMAIL || !env.LINKEDIN_PASSWORD) {
-    throw new Error('LinkedIn credentials required in environment variables');
+    throw new Error('Missing LINKEDIN_EMAIL / LINKEDIN_PASSWORD env vars');
   }
 
-  logger.info('[li] goto login');
   await safeGoto(page, 'https://www.linkedin.com/login', 'login-page');
   await debugDump(page, 'login-page');
 
-  try {
-    await page.waitForSelector('#username', { timeout: env.ELEMENT_TIMEOUT_MS });
-  } catch {
-    const curUrl = page.url();
-    logger.error({ url: curUrl }, '[li] username selector not found');
-    throw new Error('LinkedIn login page unavailable');
-  }
-
-  logger.debug('[li] typing credentials');
-  await humanDelay();
-  await page.type('#username', env.LINKEDIN_EMAIL, { delay: 50 });
-  await humanDelay();
-  await page.type('#password', env.LINKEDIN_PASSWORD, { delay: 60 });
-  await humanDelay();
+  await page.waitForSelector('#username', { timeout: SLOW_MS }).catch(() => {});
+  await human(); await page.type('#username', env.LINKEDIN_EMAIL, { delay: 70 });
+  await human(); await page.type('#password', env.LINKEDIN_PASSWORD, { delay: 70 });
+  await human(200, 500);
 
   logger.debug('[li] submitting form');
   await Promise.allSettled([
-    page.click('button[type="submit"]').catch(() => {}),
-    // allow immediate transition
-    sleep(150)
+    page.click('button[type="submit"]'),
+    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: PAGE_MS }).catch(() => {})
   ]);
+
   await debugDump(page, 'after-submit');
 
-  // Poll until we leave /login (up to LOGIN_TIMEOUT_MS)
-  const start = nowMs();
-  while (nowMs() - start < (env.LOGIN_TIMEOUT_MS || 90000)) {
-    await sleep(600);
-    const cur = page.url();
-    if (!/\/login/.test(cur)) break;
-  }
-
-  await postLoginCheckpointHandling(page);
-
   const currentUrl = page.url();
+  if (/\/checkpoint|\/challenge/.test(currentUrl)) {
+    logger.warn('[li] checkpoint/challenge detected');
+    await debugDump(page, 'checkpoint');
+  }
   logger.info({ currentUrl }, '[li] post-login URL');
 
-  if (!/\/login/.test(currentUrl)) {
-    logger.info('[li] authenticated (fresh login)');
-    await saveSession(page);
-    return page;
-  }
+  // Save new session regardless (it still works for subsequent page loads)
+  await saveSession(page);
 
-  const bodyText = await page.$eval('body', (b) => b.innerText).catch(() => '');
-  logger.error({ currentUrl, bodySnippet: String(bodyText).slice(0, 200) }, '[li] authentication failed');
-  throw new Error('Authentication failed at LinkedIn login');
+  return page;
 }
 
-/* ------------------------ scraping ------------------------ */
+// ---------- scraping helpers ----------
+/** Robust experience extractor for the /details/experience page. */
 async function extractExperienceFromDetails(page: Page) {
-  // On details/experience, there are many list items. We collect reasonable fields.
+  // Wait for the variant you showed: li.pvs-list__paged-list-item
+  await page.waitForSelector('li.pvs-list__paged-list-item', { timeout: SLOW_MS }).catch(() => {});
   await handleCookieBanner(page);
-  await page.waitForSelector('main', { timeout: env.ELEMENT_TIMEOUT_MS }).catch(() => {});
-  await sleep(1000);
-  await scrollToBottom(page, 600, 200);
-  await sleep(500);
+  // Slow scroll to ensure lazy items render
+  await page.evaluate(async () => {
+    const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
+    for (let i = 0; i < 8; i++) {
+      window.scrollBy(0, 1000);
+      await pause(400);
+    }
+  }).catch(() => {});
+  await human(500, 900);
 
-  const workHistory = await page.evaluate(() => {
+  const items = await page.evaluate(() => {
     const clean = (t?: string | null) => (t || '').replace(/\s+/g, ' ').trim();
-    const items: any[] = [];
-    const liNodes = Array.from(document.querySelectorAll('li'));
-    for (const li of liNodes) {
+
+    // Helper: pick first non-empty string from an array of selectors
+    function pick(el: Element, selectors: string[]): string {
+      for (const s of selectors) {
+        const n = el.querySelector<HTMLElement>(s);
+        if (n) {
+          const txt = clean(n.innerText || n.textContent || '');
+          if (txt) return txt;
+        }
+      }
+      return '';
+    }
+
+    // Heuristic fallback: get a few visible lines under the main text container
+    function heuristicLines(container: Element): string[] {
+      const spans = Array.from(container.querySelectorAll('span'))
+        .map(s => clean((s as HTMLElement).innerText || s.textContent || ''))
+        .filter(Boolean);
+      // Deduplicate while preserving order
+      return Array.from(new Set(spans)).slice(0, 6);
+    }
+
+    return Array.from(document.querySelectorAll('li.pvs-list__paged-list-item')).map(li => {
+      // Primary text container (your screenshot variant):
+      const main =
+        li.querySelector<HTMLElement>('div.display-flex.flex-column.align-self-center.flex-grow-1') ||
+        li.querySelector<HTMLElement>('div.pvs-entity');
+
+      if (!main) {
+        // Fallback: treat the <li> itself as container
+        const lines = heuristicLines(li);
+        const [position = '', company = '', duration = ''] = lines;
+        return { position, company, duration, description: '' };
+      }
+
+      // Try concrete patterns first (A/B variants)
       const position =
-        clean((li.querySelector('.t-bold') as HTMLElement | null)?.textContent) ||
-        clean((li.querySelector('span[aria-hidden="true"]') as HTMLElement | null)?.textContent);
+        pick(main, [
+          '.mr1.hoverable-link-text.t-bold span',
+          'span[aria-hidden="true"]',
+          '.t-bold',
+          'a[aria-hidden="true"] span',
+        ]) || heuristicLines(main)[0] || '';
 
       const company =
-        clean((li.querySelector('.t-14.t-normal') as HTMLElement | null)?.textContent) ||
-        clean((li.querySelector('.t-normal span') as HTMLElement | null)?.textContent);
+        pick(main, [
+          '.t-14.t-normal',
+          '.pv-entity__secondary-title',
+          'a[href*="/company/"] span[aria-hidden="true"]',
+        ]) || heuristicLines(main)[1] || '';
 
       const duration =
-        clean((li.querySelector('.t-14.t-black--light') as HTMLElement | null)?.textContent) ||
-        clean((li.querySelector('.t-14.t-normal.t-black--light') as HTMLElement | null)?.textContent);
+        pick(main, [
+          '.t-14.t-normal.t-black--light',
+          '.pv-entity__date-range span:nth-child(2)',
+          'span:has(time)'
+        ]) ||
+        (heuristicLines(main).find(t => /·|month|year|Present|20\d{2}/i.test(t)) || '');
 
       const description =
-        clean((li.querySelector('.pv-shared-text-with-see-more') as HTMLElement | null)?.textContent) ||
-        clean((li.querySelector('.inline-show-more-text') as HTMLElement | null)?.textContent);
+        pick(li, [
+          '.inline-show-more-text',
+          '.pv-shared-text-with-see-more',
+          '[data-test-description]'
+        ]);
 
-      if (position || company || duration || description) {
-        items.push({ position, company, duration, description });
-      }
-    }
-    return items.slice(0, 50);
+      return { position, company, duration, description };
+    }).filter(x => x.position || x.company);
   });
 
-  return workHistory;
+  return items;
 }
 
 async function extractBasicsFromMain(page: Page) {
   await handleCookieBanner(page);
-  await page.waitForSelector('main, h1', { timeout: env.ELEMENT_TIMEOUT_MS }).catch(() => {});
-  await sleep(600);
-
-  const basics = await page.evaluate(() => {
+  await page.waitForSelector('.pv-text-details__left-panel, .mt2', { timeout: SLOW_MS }).catch(() => {});
+  return await page.evaluate(() => {
     const clean = (t?: string | null) => (t || '').replace(/\s+/g, ' ').trim();
-    return {
-      name: clean(document.querySelector('.text-heading-xlarge, h1')?.textContent),
-      title: clean(document.querySelector('.text-body-medium.break-words')?.textContent),
-      location: clean(document.querySelector('.text-body-small.inline')?.textContent),
-      summary: ''
-    };
+    const name =
+      clean(document.querySelector('.text-heading-xlarge, h1')?.textContent) ||
+      clean(document.querySelector('h1')?.textContent);
+    const title = clean(document.querySelector('.text-body-medium.break-words')?.textContent);
+    const location = clean(document.querySelector('.text-body-small.inline, [data-test-location]')?.textContent);
+    return { name, title, location, summary: '' };
   });
-
-  return basics;
 }
 
+// ---------- main scrape ----------
 export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
   await enforceRateLimit();
 
@@ -300,36 +235,21 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
     logger.info({ profileUrl }, '[li] begin scrape');
     page = await authenticateLinkedIn();
 
-    // 1) Try details/experience first
+    // DETAILS page (experience)
     const detailsUrl = `${profileUrl.replace(/\/$/, '')}/details/experience/`;
     logger.info({ detailsUrl }, '[li] goto details/experience page');
     await safeGoto(page, detailsUrl, 'details-experience');
     await debugDump(page, 'after-details');
 
-    // If LinkedIn bounced us to a checkpoint/login again, stop early
-    const cur1 = page.url();
-    if (/\/login|\/checkpoint|\/challenge/.test(cur1)) {
-      logger.warn({ cur1 }, '[li] bounced away from details page');
-      throw new Error('Bounced to checkpoint/login');
-    }
+    const workHistory = await extractExperienceFromDetails(page).catch(() => []);
+    await human(500, 1000);
 
-    // Wait for some content and extract
-    const workHistory = await extractExperienceFromDetails(page).catch(async (err) => {
-      logger.warn({ err }, '[li] details/experience extraction failed; trying main page fallback');
-      return [] as any[];
-    });
-
-    // 2) Go back to main profile for basics
+    // MAIN profile (basics)
     logger.info('[li] back to main profile for summary');
     await safeGoto(page, profileUrl, 'main-profile');
     await debugDump(page, 'after-main');
 
-    const basics = await extractBasicsFromMain(page).catch(() => ({
-      name: '',
-      title: '',
-      location: '',
-      summary: ''
-    }));
+    const basics = await extractBasicsFromMain(page);
 
     const data = {
       ...basics,
@@ -339,19 +259,17 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
       connections: 0
     };
 
-    logger.info({ name: data?.name || '(unknown)', jobs: workHistory.length }, '[li] scrape succeeded');
+    logger.info({ jobs: workHistory.length }, `[li] scrape succeeded${basics.name ? ` (${basics.name})` : ''}`);
     return data;
   } catch (err) {
     logger.error({ err, profileUrl }, '[li] scrape failed — returning fallback');
     return fallbackProfile();
   } finally {
-    try {
-      await page?.close();
-    } catch { /* ignore */ }
+    try { await page?.close(); } catch { /* ignore */ }
   }
 }
 
-/* ------------------------ pipeline ------------------------ */
+// ---------- orchestrators ----------
 export async function analyzeLinkedInProfile(linkedinUrl: string) {
   return limiter.schedule(async () => {
     logger.info({ linkedinUrl }, '[li] analyzeLinkedInProfile scheduled');
