@@ -1,33 +1,145 @@
-// src/services/linkedinScraper.ts
-import type { Page } from 'puppeteer';
+import type { Page, ElementHandle } from 'puppeteer';
 import { env } from '../lib/env';
 import { logger } from '../lib/logger';
 import { enforceRateLimit, newPage, limiter } from '../lib/browser';
 import { LinkedInProfile } from '../types';
 import { loadSession, saveSession } from '../lib/session';
 import fs from 'fs';
+import path from 'path';
 
-async function sleep(ms: number) {
+/* ------------------------ tiny utils ------------------------ */
+const DUMP_DIR = '/home/ubuntu';
+function nowMs() {
+  return Date.now();
+}
+function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
-async function humanDelay(min = 300, max = 900) {
+async function humanDelay(min = 200, max = 650) {
   const ms = Math.floor(min + Math.random() * (max - min));
   return sleep(ms);
 }
-async function scrollToBottom(page: Page, step = 250, pause = 120) {
+function fileSafe(label: string) {
+  return label.replace(/[^a-z0-9-_]/gi, '_').slice(0, 80);
+}
+
+/* ------------------------ navigation helpers ------------------------ */
+async function waitForNetworkIdleLoose(page: Page, timeout = 10000) {
+  // Puppeteer has page.waitForNetworkIdle in newer versions; fall back to domcontentloaded cycle
+  try {
+    // @ts-ignore - available in recent puppeteer
+    if (typeof (page as any).waitForNetworkIdle === 'function') {
+      await (page as any).waitForNetworkIdle({ timeout });
+      return;
+    }
+  } catch {}
+  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout }).catch(() => {});
+}
+
+async function safeGoto(page: Page, url: string, label?: string) {
+  const start = nowMs();
+  const nav = page.goto(url, {
+    waitUntil: 'domcontentloaded',
+    timeout: env.PAGE_TIMEOUT_MS
+  });
+
+  // Race goto + a secondary "idle" wait so we don't evaluate during navigation
+  await Promise.race([
+    nav,
+    (async () => {
+      // backstop if goto resolves instantly
+      await sleep(250);
+    })()
+  ]).catch(() => {});
+
+  // A second barrier for network quietness
+  await waitForNetworkIdleLoose(page, Math.min(15000, (env.PAGE_TIMEOUT_MS || 60000) / 4));
+
+  const took = nowMs() - start;
+  logger.debug({ url, tookMs: took, label }, '[nav] safeGoto settled');
+}
+
+/* ------------------------ debug dump (resilient) ------------------------ */
+async function debugDump(page: Page, label: string) {
+  const ts = nowMs();
+  const base = `${fileSafe(label)}-${ts}`;
+  const pngPath = path.join(DUMP_DIR, `debug-${base}.png`);
+  const htmlPath = path.join(DUMP_DIR, `debug-${base}.html`);
+
+  try {
+    // Give nav a moment to settle to avoid exec-context-destroyed
+    await sleep(150);
+    await page.screenshot({ path: pngPath, fullPage: true }).catch(() => {});
+    let html = '';
+    for (let i = 0; i < 3; i++) {
+      try {
+        html = await page.evaluate(() => document.documentElement.outerHTML);
+        break;
+      } catch {
+        await sleep(200);
+      }
+    }
+    if (html) {
+      fs.writeFileSync(htmlPath, html, 'utf8');
+      logger.info({ pngPath, htmlPath }, '[debugDump] wrote ' + label);
+    } else {
+      logger.info({ pngPath }, '[debugDump] wrote screenshot only (HTML unavailable)');
+    }
+  } catch (err: any) {
+    logger.error({ err }, `[debugDump] failed for ${label}`);
+  }
+}
+
+/* ------------------------ DOM helpers ------------------------ */
+async function clickByText(page: Page, tag: string, substrings: string[]) {
+  const lc = substrings.map((s) => s.toLowerCase());
+  const handle = await page.evaluateHandle(
+    ({ tag, lc }) => {
+      const nodes = Array.from(document.querySelectorAll(tag));
+      return nodes.find((el) => {
+        const t = (el.textContent || '').trim().toLowerCase();
+        return lc.some((s) => t.includes(s));
+      }) || null;
+    },
+    { tag, lc }
+  );
+  const el = handle.asElement();
+  if (el) {
+    // Cast to Element handle for TS
+    await (el as unknown as ElementHandle<Element>).click({ delay: 50 }).catch(() => {});
+    return true;
+  }
+  return false;
+}
+
+async function handleCookieBanner(page: Page) {
+  // Handle common consent banners via friendly heuristics
+  try {
+    const clicked =
+      (await clickByText(page, 'button', ['accept', 'agree', 'allow all'])) ||
+      (await clickByText(page, 'button', ['okay', 'ok'])) ||
+      (await clickByText(page, 'button', ['continue']));
+    if (clicked) {
+      await sleep(300);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+async function scrollToBottom(page: Page, step = 500, pause = 200) {
   await page.evaluate(
     async ({ step, pause }) => {
       await new Promise<void>((resolve) => {
-        let total = 0;
-        const timer = setInterval(() => {
-          const scrollHeight = document.body.scrollHeight;
+        let lastY = 0;
+        const id = setInterval(() => {
           window.scrollBy(0, step);
-          total += step;
-          if (total >= scrollHeight) {
-            clearInterval(timer);
-            window.scrollTo(0, 0);
+          if (window.scrollY === lastY) {
+            clearInterval(id);
             resolve();
+            return;
           }
+          lastY = window.scrollY;
         }, pause);
       });
     },
@@ -35,36 +147,16 @@ async function scrollToBottom(page: Page, step = 250, pause = 120) {
   );
 }
 
-async function debugDump(page: Page, label: string) {
-  try {
-    const ts = Date.now();
-    const pngPath = `/home/ubuntu/debug-${label}-${ts}.png`;
-    const htmlPath = `/home/ubuntu/debug-${label}-${ts}.html`;
-    await page.screenshot({ path: pngPath, fullPage: true });
-    const html = await page.content();
-    fs.writeFileSync(htmlPath, html, 'utf8');
-    logger.info({ pngPath, htmlPath }, `[debugDump] wrote ${label}`);
-  } catch (err) {
-    logger.error({ err }, `[debugDump] failed for ${label}`);
+/* ------------------------ auth + session ------------------------ */
+async function postLoginCheckpointHandling(page: Page) {
+  const url = page.url();
+  if (/\/checkpoint|\/challenge/.test(url)) {
+    logger.warn('[li] checkpoint/challenge detected');
+    await debugDump(page, 'checkpoint');
+    // Let human solve via DevTools tunnel if needed; we proceed optimistically.
   }
 }
 
-async function handleCookieBanner(page: Page) {
-  try {
-    const banner = await page.$('button[aria-label="Accept cookies"]');
-    if (banner) {
-      await banner.click().catch(() => {});
-      await sleep(500);
-    }
-  } catch (err) {
-    logger.warn({ err }, '[li] cookie banner handler crashed');
-    await debugDump(page, 'cookie-crash');
-  }
-}
-
-/**
- * Try session cookies first. If invalid or missing, do fresh login.
- */
 export async function authenticateLinkedIn(): Promise<Page> {
   const page = await newPage();
 
@@ -72,10 +164,7 @@ export async function authenticateLinkedIn(): Promise<Page> {
   try {
     const loaded = await loadSession(page);
     if (loaded) {
-      await page.goto('https://www.linkedin.com/feed/', {
-        waitUntil: 'domcontentloaded',
-        timeout: env.PAGE_TIMEOUT_MS
-      });
+      await safeGoto(page, 'https://www.linkedin.com/feed/', 'session-check');
       const url = page.url();
       logger.info({ url }, '[li] session check /feed');
       if (!/\/login|\/checkpoint|\/challenge/.test(url)) {
@@ -94,65 +183,114 @@ export async function authenticateLinkedIn(): Promise<Page> {
   }
 
   logger.info('[li] goto login');
-  await page.goto('https://www.linkedin.com/login', {
-    waitUntil: 'domcontentloaded',
-    timeout: env.PAGE_TIMEOUT_MS
-  });
+  await safeGoto(page, 'https://www.linkedin.com/login', 'login-page');
   await debugDump(page, 'login-page');
 
   try {
-    logger.debug('[li] waiting for #username');
     await page.waitForSelector('#username', { timeout: env.ELEMENT_TIMEOUT_MS });
   } catch {
     const curUrl = page.url();
-    await debugDump(page, 'login-missing-username');
     logger.error({ url: curUrl }, '[li] username selector not found');
     throw new Error('LinkedIn login page unavailable');
   }
 
   logger.debug('[li] typing credentials');
   await humanDelay();
-  await page.type('#username', env.LINKEDIN_EMAIL, { delay: 80 });
+  await page.type('#username', env.LINKEDIN_EMAIL, { delay: 50 });
   await humanDelay();
-  await page.type('#password', env.LINKEDIN_PASSWORD, { delay: 80 });
+  await page.type('#password', env.LINKEDIN_PASSWORD, { delay: 60 });
   await humanDelay();
+
   logger.debug('[li] submitting form');
-  await page.click('button[type="submit"]');
+  await Promise.allSettled([
+    page.click('button[type="submit"]').catch(() => {}),
+    // allow immediate transition
+    sleep(150)
+  ]);
   await debugDump(page, 'after-submit');
 
-  // Poll for redirect
-  const start = Date.now();
-  while (Date.now() - start < env.LOGIN_TIMEOUT_MS) {
-    await sleep(1000);
+  // Poll until we leave /login (up to LOGIN_TIMEOUT_MS)
+  const start = nowMs();
+  while (nowMs() - start < (env.LOGIN_TIMEOUT_MS || 90000)) {
+    await sleep(600);
     const cur = page.url();
-    if (!cur.includes('/login')) break;
+    if (!/\/login/.test(cur)) break;
   }
+
+  await postLoginCheckpointHandling(page);
 
   const currentUrl = page.url();
   logger.info({ currentUrl }, '[li] post-login URL');
-  if (currentUrl.includes('/checkpoint') || currentUrl.includes('/challenge')) {
-    logger.warn('[li] checkpoint/challenge detected');
-    await debugDump(page, 'checkpoint');
-  }
 
-  if (!currentUrl.includes('/login')) {
+  if (!/\/login/.test(currentUrl)) {
     logger.info('[li] authenticated (fresh login)');
-    await saveSession(page); // ✅ save new cookies for reuse
+    await saveSession(page);
     return page;
   }
 
   const bodyText = await page.$eval('body', (b) => b.innerText).catch(() => '');
-  await debugDump(page, 'auth-failed');
-  logger.error(
-    { currentUrl, bodySnippet: bodyText?.slice(0, 200) || '' },
-    '[li] authentication failed'
-  );
+  logger.error({ currentUrl, bodySnippet: String(bodyText).slice(0, 200) }, '[li] authentication failed');
   throw new Error('Authentication failed at LinkedIn login');
 }
 
-/**
- * Scrape full profile data, preferring the /details/experience/ page for work history.
- */
+/* ------------------------ scraping ------------------------ */
+async function extractExperienceFromDetails(page: Page) {
+  // On details/experience, there are many list items. We collect reasonable fields.
+  await handleCookieBanner(page);
+  await page.waitForSelector('main', { timeout: env.ELEMENT_TIMEOUT_MS }).catch(() => {});
+  await sleep(1000);
+  await scrollToBottom(page, 600, 200);
+  await sleep(500);
+
+  const workHistory = await page.evaluate(() => {
+    const clean = (t?: string | null) => (t || '').replace(/\s+/g, ' ').trim();
+    const items: any[] = [];
+    const liNodes = Array.from(document.querySelectorAll('li'));
+    for (const li of liNodes) {
+      const position =
+        clean((li.querySelector('.t-bold') as HTMLElement | null)?.textContent) ||
+        clean((li.querySelector('span[aria-hidden="true"]') as HTMLElement | null)?.textContent);
+
+      const company =
+        clean((li.querySelector('.t-14.t-normal') as HTMLElement | null)?.textContent) ||
+        clean((li.querySelector('.t-normal span') as HTMLElement | null)?.textContent);
+
+      const duration =
+        clean((li.querySelector('.t-14.t-black--light') as HTMLElement | null)?.textContent) ||
+        clean((li.querySelector('.t-14.t-normal.t-black--light') as HTMLElement | null)?.textContent);
+
+      const description =
+        clean((li.querySelector('.pv-shared-text-with-see-more') as HTMLElement | null)?.textContent) ||
+        clean((li.querySelector('.inline-show-more-text') as HTMLElement | null)?.textContent);
+
+      if (position || company || duration || description) {
+        items.push({ position, company, duration, description });
+      }
+    }
+    return items.slice(0, 50);
+  });
+
+  return workHistory;
+}
+
+async function extractBasicsFromMain(page: Page) {
+  await handleCookieBanner(page);
+  await page.waitForSelector('main, h1', { timeout: env.ELEMENT_TIMEOUT_MS }).catch(() => {});
+  await sleep(600);
+
+  const basics = await page.evaluate(() => {
+    const clean = (t?: string | null) => (t || '').replace(/\s+/g, ' ').trim();
+    return {
+      name: clean(document.querySelector('.text-heading-xlarge, h1')?.textContent),
+      title: clean(document.querySelector('.text-body-medium.break-words')?.textContent),
+      location: clean(document.querySelector('.text-body-small.inline')?.textContent),
+      summary: ''
+    };
+  });
+
+  return basics;
+}
+
 export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
   await enforceRateLimit();
 
@@ -162,98 +300,58 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
     logger.info({ profileUrl }, '[li] begin scrape');
     page = await authenticateLinkedIn();
 
-    // Construct details URL for experience
+    // 1) Try details/experience first
     const detailsUrl = `${profileUrl.replace(/\/$/, '')}/details/experience/`;
     logger.info({ detailsUrl }, '[li] goto details/experience page');
-    await page.goto(detailsUrl, {
-      waitUntil: 'domcontentloaded',
-      timeout: env.PAGE_TIMEOUT_MS
-    });
+    await safeGoto(page, detailsUrl, 'details-experience');
     await debugDump(page, 'after-details');
 
-    await handleCookieBanner(page);
+    // If LinkedIn bounced us to a checkpoint/login again, stop early
+    const cur1 = page.url();
+    if (/\/login|\/checkpoint|\/challenge/.test(cur1)) {
+      logger.warn({ cur1 }, '[li] bounced away from details page');
+      throw new Error('Bounced to checkpoint/login');
+    }
 
-    // Wait for job entries
-    await page.waitForSelector('.optional-action-target-wrapper', {
-      timeout: env.ELEMENT_TIMEOUT_MS
-    }).catch(async (err) => {
-      logger.error({ err }, '[li] selector timeout at details page');
-      await debugDump(page!, 'details-timeout');
-      throw err;
+    // Wait for some content and extract
+    const workHistory = await extractExperienceFromDetails(page).catch(async (err) => {
+      logger.warn({ err }, '[li] details/experience extraction failed; trying main page fallback');
+      return [] as any[];
     });
 
-    await sleep(2000);
-    await scrollToBottom(page);
-    await sleep(1000);
-
-    logger.debug('[li] extracting work history from details page');
-    const workHistory = await page.evaluate(() => {
-      const clean = (t?: string | null) => (t || '').replace(/\s+/g, ' ').trim();
-
-      return Array.from(document.querySelectorAll('li')).map((li) => {
-        const position = clean(li.querySelector('.t-bold')?.textContent);
-        const company = clean(
-          li.querySelector('.t-14.t-normal')?.textContent ||
-            li.querySelector('.t-normal span')?.textContent
-        );
-        const duration = clean(
-          li.querySelector('.t-14.t-black--light')?.textContent ||
-            li.querySelector('.t-14.t-normal.t-black--light')?.textContent
-        );
-        const description = clean(
-          li.querySelector('.pv-shared-text-with-see-more')?.textContent ||
-            li.querySelector('.inline-show-more-text')?.textContent
-        );
-
-        if (position || company) {
-          return {
-            position,
-            company,
-            duration,
-            description
-          };
-        }
-        return null;
-      }).filter(Boolean);
-    });
-
-    // Basic profile info still comes from main page
+    // 2) Go back to main profile for basics
     logger.info('[li] back to main profile for summary');
-    await page.goto(profileUrl, {
-      waitUntil: 'domcontentloaded',
-      timeout: env.PAGE_TIMEOUT_MS
-    });
+    await safeGoto(page, profileUrl, 'main-profile');
     await debugDump(page, 'after-main');
 
-    const basics = await page.evaluate(() => {
-      const clean = (t?: string | null) => (t || '').replace(/\s+/g, ' ').trim();
-      return {
-        name: clean(document.querySelector('.text-heading-xlarge, h1')?.textContent),
-        title: clean(document.querySelector('.text-body-medium.break-words')?.textContent),
-        location: clean(document.querySelector('.text-body-small.inline')?.textContent),
-        summary: ''
-      };
-    });
+    const basics = await extractBasicsFromMain(page).catch(() => ({
+      name: '',
+      title: '',
+      location: '',
+      summary: ''
+    }));
 
-    const data = { ...basics, workHistory, education: [], skills: [], connections: 0 };
-    logger.info(
-      { name: data?.name || '(unknown)', jobs: workHistory.length },
-      '[li] scrape succeeded'
-    );
+    const data = {
+      ...basics,
+      workHistory,
+      education: [],
+      skills: [],
+      connections: 0
+    };
+
+    logger.info({ name: data?.name || '(unknown)', jobs: workHistory.length }, '[li] scrape succeeded');
     return data;
   } catch (err) {
-    await debugDump(page!, 'scrape-error');
     logger.error({ err, profileUrl }, '[li] scrape failed — returning fallback');
     return fallbackProfile();
   } finally {
     try {
       await page?.close();
-    } catch {
-      /* ignore */
-    }
+    } catch { /* ignore */ }
   }
 }
 
+/* ------------------------ pipeline ------------------------ */
 export async function analyzeLinkedInProfile(linkedinUrl: string) {
   return limiter.schedule(async () => {
     logger.info({ linkedinUrl }, '[li] analyzeLinkedInProfile scheduled');
