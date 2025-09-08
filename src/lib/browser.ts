@@ -1,4 +1,3 @@
-// src/lib/browser.ts
 import path from 'path';
 import fs, { existsSync } from 'fs';
 import os from 'os';
@@ -16,7 +15,7 @@ let lastRequestTime = 0;
 
 /* ───────────────────────── rate limiter ───────────────────────── */
 export const limiter = new Bottleneck({
-  minTime: Number.isFinite(env.REQUEST_DELAY_MS) ? env.REQUEST_DELAY_MS : 45000,
+  minTime: Number.isFinite(env.REQUEST_DELAY_MS) ? env.REQUEST_DELAY_MS : 45_000,
   maxConcurrent: 1
 });
 
@@ -66,8 +65,34 @@ function ensureDir(p: string) {
   } catch { /* ignore */ }
 }
 
+/**
+ * Remove Chrome/Chromium singleton lock files that can be left behind
+ * if the same profile was used on another host or a crash occurred.
+ */
+function unlockChromeProfile(userDataDir: string) {
+  try {
+    const entries = fs.readdirSync(userDataDir, { withFileTypes: true });
+    const targets = entries
+      .filter((e) => e.isFile())
+      .map((e) => e.name)
+      .filter((name) => /^Singleton(Browser|Cookie|Lock|Socket)$/i.test(name));
+
+    for (const name of targets) {
+      const full = path.join(userDataDir, name);
+      try {
+        fs.rmSync(full, { force: true });
+        logger.warn({ file: full }, '[browser] removed singleton lock');
+      } catch (err) {
+        logger.warn({ file: full, err }, '[browser] failed to remove singleton lock');
+      }
+    }
+  } catch (err) {
+    logger.debug({ err }, '[browser] unlockChromeProfile skipped');
+  }
+}
+
 /* ───────────────────────── browser lifecycle ───────────────────────── */
-async function launchBrowser(): Promise<Browser> {
+async function innerLaunch(): Promise<Browser> {
   const executablePath = resolveExecutablePath();
 
   // Force HEADFUL when env.HEADFUL is true; otherwise follow PUPPETEER_HEADLESS
@@ -85,6 +110,8 @@ async function launchBrowser(): Promise<Browser> {
       : path.join(os.homedir(), 'chrome-profile-ec2');
 
   ensureDir(userDataDir);
+  // proactively clear stale singleton locks
+  unlockChromeProfile(userDataDir);
 
   const args = [
     `--user-data-dir=${userDataDir}`,
@@ -100,20 +127,27 @@ async function launchBrowser(): Promise<Browser> {
     '--disable-features=IsolateOrigins,site-per-process',
     '--password-store=basic',
     '--enable-features=NetworkService,NetworkServiceInProcess',
-    // Remote debugging so you can tunnel in and solve checkpoints once
     '--remote-debugging-port=9222',
-    // Make it feel like a normal desktop browser session
     '--autoplay-policy=no-user-gesture-required',
     '--no-first-run',
     '--no-default-browser-check'
   ];
+
+  // Proxy support (Decodo)
+  if (env.PROXY_ENABLED && env.PROXY_SERVER) {
+    args.push(`--proxy-server=${env.PROXY_SERVER}`);
+    if (env.PROXY_BYPASS?.trim()) {
+      // Note: this flag is Chromium compatible; values are comma-separated hosts.
+      args.push(`--proxy-bypass-list=${env.PROXY_BYPASS}`);
+    }
+  }
 
   const opts: PuppeteerLaunchOptions = {
     headless, // will be false on EC2 if HEADFUL=true
     executablePath,
     args,
     defaultViewport: { width: 1366, height: 768 },
-    protocolTimeout: Math.max(Number(env.PAGE_TIMEOUT_MS) || 0, 120000)
+    protocolTimeout: Math.max(Number(env.PAGE_TIMEOUT_MS) || 0, 120_000)
   };
 
   logger.info(
@@ -123,6 +157,11 @@ async function launchBrowser(): Promise<Browser> {
       executablePath: executablePath ?? '(auto)',
       userDataDir,
       display: process.env.DISPLAY,
+      proxy: {
+        enabled: env.PROXY_ENABLED,
+        server: env.PROXY_SERVER || 'unset',
+        bypass: env.PROXY_BYPASS
+      },
       args
     },
     '[browser] launching (EC2 HEADFUL)'
@@ -138,8 +177,28 @@ async function launchBrowser(): Promise<Browser> {
 
   const version = await b.version().catch(() => 'unknown');
   logger.info({ version }, '[browser] launched');
-
   return b;
+}
+
+async function launchBrowser(): Promise<Browser> {
+  try {
+    return await innerLaunch();
+  } catch (err: any) {
+    const msg = String(err?.message || err);
+    // Retry once if profile lock error
+    if (/profile appears to be in use/i.test(msg)) {
+      logger.warn({ err }, '[browser] launch failed due to profile lock — unlocking & retrying once');
+      try {
+        const dir =
+          env.CHROME_USER_DATA_DIR && env.CHROME_USER_DATA_DIR.trim()
+            ? path.resolve(env.CHROME_USER_DATA_DIR)
+            : path.join(os.homedir(), 'chrome-profile-ec2');
+        unlockChromeProfile(dir);
+      } catch {/* ignore */}
+      return await innerLaunch();
+    }
+    throw err;
+  }
 }
 
 export async function getBrowser(): Promise<Browser> {
@@ -166,10 +225,23 @@ export async function newPage(): Promise<Page> {
     const b = await getBrowser();
     const page = await b.newPage();
 
+    // Apply proxy auth if present
+    if (env.PROXY_ENABLED && env.PROXY_USERNAME && env.PROXY_PASSWORD) {
+      try {
+        await page.authenticate({
+          username: env.PROXY_USERNAME,
+          password: env.PROXY_PASSWORD
+        });
+        logger.debug('[browser] proxy credentials applied to page');
+      } catch (err) {
+        logger.warn({ err }, '[browser] failed to apply proxy credentials');
+      }
+    }
+
     // Timeouts tuned for slower EC2 CPUs
     try {
-      page.setDefaultNavigationTimeout(Number(env.PAGE_TIMEOUT_MS) || 120000);
-      page.setDefaultTimeout(Number(env.ELEMENT_TIMEOUT_MS) || 45000);
+      page.setDefaultNavigationTimeout(Number(env.PAGE_TIMEOUT_MS) || 120_000);
+      page.setDefaultTimeout(Number(env.ELEMENT_TIMEOUT_MS) || 45_000);
     } catch { /* ignore */ }
 
     // Desktop fingerprint (stable UA helps)
@@ -230,6 +302,16 @@ export async function newPage(): Promise<Page> {
 
     const b = await getBrowser();
     const page = await b.newPage();
+
+    if (env.PROXY_ENABLED && env.PROXY_USERNAME && env.PROXY_PASSWORD) {
+      try {
+        await page.authenticate({
+          username: env.PROXY_USERNAME,
+          password: env.PROXY_PASSWORD
+        });
+      } catch {/* ignore */}
+    }
+
     await page.setBypassCSP(true);
     logger.debug('[browser] new page created after relaunch');
     return page;
@@ -240,7 +322,7 @@ export async function newPage(): Promise<Page> {
 export async function enforceRateLimit() {
   const now = Date.now();
   const elapsed = now - lastRequestTime;
-  const delay = Number.isFinite(env.REQUEST_DELAY_MS) ? env.REQUEST_DELAY_MS : 45000;
+  const delay = Number.isFinite(env.REQUEST_DELAY_MS) ? env.REQUEST_DELAY_MS : 45_000;
   if (elapsed < delay) {
     const wait = delay - elapsed;
     logger.info({ waitMs: wait }, '[browser] rate limiting: waiting…');

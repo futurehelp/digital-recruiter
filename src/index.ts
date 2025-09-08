@@ -23,7 +23,6 @@ async function startupBrowserPreflight() {
 }
 
 async function main() {
-  // Early summary including which OpenAI model will be used
   logger.info(safeEnvSummary(), '[startup] Environment summary');
 
   // ultra-early stdout (helps when logger transport is misconfigured)
@@ -38,7 +37,11 @@ async function main() {
       headless: env.PUPPETEER_HEADLESS,
       execPath: env.PUPPETEER_EXECUTABLE_PATH || '(auto)',
       userDataDir: env.CHROME_USER_DATA_DIR,
-      logLevel: env.LOG_LEVEL
+      logLevel: env.LOG_LEVEL,
+      proxy: {
+        enabled: env.PROXY_ENABLED,
+        server: env.PROXY_SERVER || 'unset'
+      }
     })
   );
 
@@ -54,14 +57,19 @@ async function main() {
         execPath: env.PUPPETEER_EXECUTABLE_PATH || '(auto)',
         userDataDir: env.CHROME_USER_DATA_DIR,
         logLevel: env.LOG_LEVEL,
-        openaiModel: env.OPENAI_MODEL // 👈 also log the model here
+        openaiModel: env.OPENAI_MODEL,
+        proxy: {
+          enabled: env.PROXY_ENABLED,
+          server: env.PROXY_SERVER || 'unset',
+          bypass: env.PROXY_BYPASS
+        }
       },
       '🚀 Backend listening'
     );
     logger.info(`📊 Health: http://localhost:${env.PORT}/health`);
   });
 
-  // don’t block the listener; do browser preflight in the background
+  // don’t block the listener; do browser preflight after boot
   setImmediate(() => {
     startupBrowserPreflight().catch((err) =>
       logger.error({ err }, '[startup] preflight threw')

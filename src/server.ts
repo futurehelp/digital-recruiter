@@ -11,6 +11,7 @@ import { router } from './routes';
 import { errorHandler } from './middleware/errorHandler';
 import { logger } from './lib/logger';
 import { getBrowser, newPage } from './lib/browser';
+import { env } from './lib/env';
 
 function scrubBody(body: any) {
   try {
@@ -25,7 +26,6 @@ function scrubBody(body: any) {
 
 export async function createServer() {
   const app = express();
-
   app.set('trust proxy', 1);
 
   app.use(helmet());
@@ -111,7 +111,20 @@ export async function createServer() {
       await page.goto('about:blank', { waitUntil: 'domcontentloaded' }).catch(() => {});
       const ua = await page.evaluate(() => navigator.userAgent).catch(() => 'n/a');
       await page.close().catch(() => {});
-      res.json({ ok: true, version, ua, headful: process.env.HEADFUL, exec: process.env.PUPPETEER_EXECUTABLE_PATH });
+      res.json({
+        ok: true,
+        version,
+        ua,
+        headful: process.env.HEADFUL,
+        exec: process.env.PUPPETEER_EXECUTABLE_PATH || '(auto)',
+        proxy: {
+          enabled: env.PROXY_ENABLED,
+          server: env.PROXY_SERVER || 'unset',
+          bypass: env.PROXY_BYPASS,
+          usernameSet: Boolean(env.PROXY_USERNAME),
+          passwordSet: Boolean(env.PROXY_PASSWORD)
+        }
+      });
     } catch (err) {
       next(err);
     }

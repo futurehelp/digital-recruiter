@@ -1,16 +1,13 @@
-// src/lib/env.ts
 import { z } from 'zod';
 import * as dotenv from 'dotenv';
 
 dotenv.config();
 
-const Bool = z
-  .union([z.string(), z.boolean()])
-  .transform((v) => {
-    if (typeof v === 'boolean') return v;
-    const s = (v ?? '').toString().trim().toLowerCase();
-    return ['1', 'true', 'yes', 'y', 'on'].includes(s);
-  });
+const bool = (def: boolean) =>
+  z
+    .string()
+    .optional()
+    .transform((v) => (typeof v === 'string' ? v.toLowerCase() === 'true' : def));
 
 const EnvSchema = z.object({
   // App
@@ -30,74 +27,65 @@ const EnvSchema = z.object({
   // Feature flags
   FORCE_MOCK_AI: z.string().default('false'),
 
-  // Browser
-  PUPPETEER_EXECUTABLE_PATH: z.string().optional(), // leave blank on EC2
-  PUPPETEER_HEADLESS: Bool.default(false),          // you run headful on EC2
-  HEADFUL: Bool.default(true),                      // default headful
-  CHROME_USER_DATA_DIR: z
-    .string()
-    .default(process.platform === 'linux' ? '/home/ubuntu/chrome-profile-ec2' : './chrome-profile-local'),
-  STARTUP_BROWSER_CHECK: Bool.default(true),
-
-  // Xvfb DISPLAY (Linux)
-  DISPLAY: z.string().default(':99'),
+  // Browser / Puppeteer
+  PUPPETEER_EXECUTABLE_PATH: z.string().optional(),
+  PUPPETEER_HEADLESS: bool(true),
+  HEADFUL: bool(false),
+  CHROME_USER_DATA_DIR: z.string().default('./chrome-profile-local'),
+  STARTUP_BROWSER_CHECK: bool(true),
 
   // Session persistence
-  COOKIES_FILE: z
-    .string()
-    .default(process.platform === 'linux' ? '/home/ubuntu/linkedin_session.json' : './linkedin_session.json'),
+  COOKIES_FILE: z.string().default('./linkedin_session.json'),
 
   // Timeouts
   REQUEST_DELAY_MS: z.coerce.number().default(45_000),
-  PAGE_TIMEOUT_MS: z.coerce.number().default(120_000),
+  PAGE_TIMEOUT_MS: z.coerce.number().default(60_000),
   LOGIN_TIMEOUT_MS: z.coerce.number().default(90_000),
-  ELEMENT_TIMEOUT_MS: z.coerce.number().default(45_000),
+  ELEMENT_TIMEOUT_MS: z.coerce.number().default(30_000),
 
   // Logging
-  LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent']).default('info'),
+  LOG_LEVEL: z
+    .enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent'])
+    .default('info'),
 
-  // ---------- Residential Proxy (e.g., Decodo) ----------
-  // PROXY_SERVER should be like "http://gate.decodo.com:10001" or "socks5://host:port"
-  PROXY_SERVER: z.string().optional(),
+  // Proxy (Decodo)
+  PROXY_ENABLED: bool(false),
+  PROXY_SERVER: z.string().optional(), // e.g. "http://gate.decodo.com:10001"
   PROXY_USERNAME: z.string().optional(),
-  PROXY_PASSWORD: z.string().optional()
+  PROXY_PASSWORD: z.string().optional(),
+  PROXY_BYPASS: z.string().default('localhost,127.0.0.1') // comma-separated
 });
 
 export const env = EnvSchema.parse(process.env);
 
-// Small helpers
-function mask(v?: string, keepStart = 4, keepEnd = 2) {
-  if (!v) return 'unset';
-  if (v.length <= keepStart + keepEnd) return `${v[0]}***`;
-  return `${v.slice(0, keepStart)}…${v.slice(-keepEnd)}`;
-}
-
 export function safeEnvSummary() {
+  const mask = (val?: string) => {
+    if (!val) return 'unset';
+    if (val.length <= 6) return 'set';
+    return `${val.slice(0, 3)}…${val.slice(-2)}`;
+  };
+
   return {
     NODE_ENV: env.NODE_ENV,
     PORT: env.PORT,
 
     OPENAI_MODEL: env.OPENAI_MODEL,
     OPENAI_API_BASE: env.OPENAI_API_BASE,
-    OPENAI_API_KEY: mask(env.OPENAI_API_KEY, 6, 4),
+    OPENAI_API_KEY: mask(env.OPENAI_API_KEY),
 
     HEADFUL: env.HEADFUL,
     PUPPETEER_HEADLESS: env.PUPPETEER_HEADLESS,
     PUPPETEER_EXECUTABLE_PATH: env.PUPPETEER_EXECUTABLE_PATH || '(auto)',
     CHROME_USER_DATA_DIR: env.CHROME_USER_DATA_DIR,
-    DISPLAY: env.DISPLAY,
-
     COOKIES_FILE: env.COOKIES_FILE,
+
     STARTUP_BROWSER_CHECK: env.STARTUP_BROWSER_CHECK,
     LOG_LEVEL: env.LOG_LEVEL,
 
-    // Proxy summary (masked)
+    PROXY_ENABLED: env.PROXY_ENABLED,
     PROXY_SERVER: env.PROXY_SERVER || 'unset',
-    PROXY_USERNAME: env.PROXY_USERNAME ? mask(env.PROXY_USERNAME, 3, 2) : 'unset',
-    PROXY_PASSWORD: env.PROXY_PASSWORD ? mask(env.PROXY_PASSWORD, 2, 2) : 'unset',
-    PROXY_ENABLED:
-      Boolean(env.PROXY_SERVER) &&
-      Boolean(env.PROXY_USERNAME) &&
-      Boolean(env.PROXY_PASSWORD)
+    PROXY_USERNAME: mask(env.PROXY_USERNAME),
+    PROXY_PASSWORD: mask(env.PROXY_PASSWORD),
+    PROXY_BYPASS: env.PROXY_BYPASS
   };
 }
