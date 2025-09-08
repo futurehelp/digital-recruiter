@@ -1,6 +1,6 @@
 // src/server.ts
 import express, { Request, Response, NextFunction } from 'express';
-import cors, { CorsOptions } from 'cors';
+import cors from 'cors';
 import helmet from 'helmet';
 import hpp from 'hpp';
 import rateLimit from 'express-rate-limit';
@@ -13,130 +13,45 @@ import { errorHandler } from './middleware/errorHandler';
 import { logger } from './lib/logger';
 import { getBrowser, newPage } from './lib/browser';
 
-/** Safely mask sensitive fields for debug logging */
 function scrubBody(body: any) {
   try {
     if (!body || typeof body !== 'object') return body;
     const clone = { ...body };
-    for (const key of Object.keys(clone)) {
-      const k = key.toLowerCase();
-      if (k.includes('password') || k.includes('secret') || k.includes('token')) {
-        (clone as any)[key] = '[REDACTED]';
-      }
-    }
+    if ('password' in clone) (clone as any).password = '[REDACTED]';
     return clone;
   } catch {
     return {};
   }
 }
 
-/** Build permissive-but-safe CORS config with a whitelist + regex for Vercel */
-function buildCorsOptions(): CorsOptions {
-  // Allow overriding/augmenting via env, comma-separated
-  const envOrigins = (process.env.CORS_ORIGINS ?? '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
-
-  // Known frontends
-  const STATIC_WHITELIST = new Set<string>([
-    'https://linkedin-digital-recruiter-frontend.vercel.app',
-    'https://talentflux.today',
-    'https://www.talentflux.today',
-    'http://localhost:3000',
-    'http://127.0.0.1:3000',
-    ...envOrigins,
-  ]);
-
-  // Accept preview deployments like https://<branch>-<proj>.vercel.app
-  const VERCEL_REGEX = /^https:\/\/[a-z0-9-]+\.vercel\.app$/i;
-
-  const origin: CorsOptions['origin'] = (reqOrigin, callback) => {
-    // Non-browser requests (e.g. cURL) have no Origin → allow
-    if (!reqOrigin) return callback(null, true);
-
-    if (STATIC_WHITELIST.has(reqOrigin) || VERCEL_REGEX.test(reqOrigin)) {
-      return callback(null, true);
-    }
-
-    // Optional: log rejected origins to help diagnose
-    logger.warn({ origin: reqOrigin }, 'cors.rejected_origin');
-    return callback(new Error('CORS: Origin not allowed'));
-  };
-
-  return {
-    origin,
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: [
-      'Content-Type',
-      'Authorization',
-      'X-Requested-With',
-      'x-request-id',
-      'x-correlation-id',
-    ],
-    exposedHeaders: ['Content-Length', 'X-Request-Id'],
-    maxAge: 86400, // cache preflight for a day
-    optionsSuccessStatus: 204,
-  };
-}
-
 export async function createServer() {
   const app = express();
 
-  // Trust proxy (ELB/ALB/Cloudflare) for correct req.ip and secure cookies
   app.set('trust proxy', 1);
 
-  // Security & hardening
   app.use(
     helmet({
-      // Keep defaults; disable COEP/COOP that can break EventSource unless you need them
       crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
     }),
   );
   app.use(hpp());
 
-  // CORS (global) + explicit preflight for all routes
-  const corsOptions = buildCorsOptions();
-  app.use(cors(corsOptions));
-  app.options('*', cors(corsOptions));
+  // 🚨 POC CORS: allow ALL origins (not safe for prod)
+  app.use(cors({ origin: '*', credentials: false }));
+  app.options('*', cors({ origin: '*', credentials: false }));
 
-  // Body parsing
   app.use(express.json({ limit: '1mb' }));
 
-  // HTTP logging with pino-http
   const httpLoggerOptions: PinoHttpOptions<IncomingMessage, ServerResponse> = {
     autoLogging: { ignore: () => false },
     genReqId: (req: IncomingMessage) =>
       (req.headers['x-request-id'] as string) ||
       (req.headers['x-correlation-id'] as string) ||
       randomUUID(),
-    serializers: {
-      req(req: IncomingMessage) {
-        return {
-          method: (req as any).method,
-          url: (req as any).url,
-          headers: req.headers,
-        };
-      },
-      res(res: ServerResponse) {
-        const ex = res as any;
-        return {
-          statusCode: ex.statusCode,
-          headers: typeof ex.getHeaders === 'function' ? ex.getHeaders() : {},
-        };
-      },
-    },
-    customSuccessMessage(req, res) {
-      return `OK ${(req as any).method} ${(req as any).url} ${(res as any).statusCode}`;
-    },
-    customErrorMessage(req, res, err) {
-      return `ERR ${(req as any).method} ${(req as any).url} ${(res as any).statusCode} - ${err.message}`;
-    },
   };
   app.use(pinoHttp(httpLoggerOptions));
 
-  // Timing + request snapshot (after body parser, before routes)
+  // Timing + body snapshot
   app.use((req: Request, res: Response, next: NextFunction) => {
     const start = process.hrtime.bigint();
     const snap = JSON.stringify(req.body ?? {});
@@ -158,15 +73,13 @@ export async function createServer() {
     next();
   });
 
-  // Rate limiter (proxy-safe)
+  // Rate limiter
   app.use(
     rateLimit({
       windowMs: 15 * 60 * 1000,
       max: 100,
       standardHeaders: true,
       legacyHeaders: false,
-      keyGenerator: (req) =>
-        req.ip || (req.headers['x-forwarded-for'] as string) || 'unknown',
     }),
   );
 
@@ -175,7 +88,7 @@ export async function createServer() {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
   });
 
-  // DEBUG: ensure headless browser availability from HTTP
+  // Debug browser preflight
   app.get('/debug/preflight', async (_req, res, next) => {
     try {
       const browser = await getBrowser();
@@ -196,42 +109,36 @@ export async function createServer() {
     }
   });
 
-  // 🔊 Minimal SSE stream so the frontend's EventSource doesn't 404
-  // CORS is already handled globally; keep SSE headers specific to streaming
+  // SSE stream
   app.get('/api/progress/stream', (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
-    // Flush headers for proxies if available
     (res as any).flushHeaders?.();
 
-    // Initial event
     res.write(`event: hello\ndata: {"ok":true}\n\n`);
 
-    // Heartbeat keepalive (avoid idle timeouts on ALB / proxies)
     const timer = setInterval(() => {
       res.write(`event: ping\ndata: {"t":${Date.now()}}\n\n`);
-    }, 25_000);
+    }, 25000);
 
     req.on('close', () => {
       clearInterval(timer);
       try {
         res.end();
-      } catch {
-        /* ignore */
-      }
+      } catch {}
     });
   });
 
-  // Mount API routes (ensure your /api/analyze-profile lives under router)
+  // Your routes
   app.use(router);
 
-  // 404 (after all routes)
+  // 404
   app.use('*', (_req: Request, res: Response) => {
     res.status(404).json({ error: 'Endpoint not found' });
   });
 
-  // Centralized error handler (should come last)
+  // Error handler
   app.use(errorHandler);
 
   return app;
