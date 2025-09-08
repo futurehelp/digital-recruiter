@@ -8,7 +8,7 @@ import { loadSession, saveSession } from '../lib/session';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Ensures an env value is a non-empty string; throws early if missing. */
+/** Ensure an env value is a non-empty string; throw early if missing. */
 function requireEnv(name: string, value: unknown): string {
   const v = (value ?? '').toString().trim();
   if (!v) {
@@ -26,58 +26,42 @@ export async function authenticateLinkedIn(): Promise<Page> {
   try {
     logger.info('[li] Starting authentication');
 
-    // Try to load saved session
-    const hasSession = await loadSession(page);
-    if (hasSession) {
-      await page.goto('https://www.linkedin.com/feed/', {
-        waitUntil: 'networkidle2',
-        timeout: 60000
-      });
-
-      // Check if logged in
-      const url = page.url();
-      if (!url.includes('/login') && !url.includes('/checkpoint')) {
-        logger.info('[li] Authenticated via saved session');
-        return page;
-      }
-    }
-
-    // Need to login
-    logger.info('[li] Logging in with credentials');
+    // Skip session validation - go straight to login (proxy stability)
+    logger.info('[li] Going directly to login page');
     await page.goto('https://www.linkedin.com/login', {
       waitUntil: 'networkidle2',
-      timeout: 60000
+      timeout: 60000,
     });
 
-    // Wait for login form - use the actual field names LinkedIn uses
+    // Wait for login form - LinkedIn's field names
     await page.waitForSelector('input[name="session_key"]', { timeout: 30000 });
     await page.waitForSelector('input[name="session_password"]', { timeout: 30000 });
 
-    // 🔒 Coerce env to strings (throws if missing) → fixes TS errors
-    const email: string = requireEnv('LINKEDIN_EMAIL', env.LINKEDIN_EMAIL);
-    const password: string = requireEnv('LINKEDIN_PASSWORD', env.LINKEDIN_PASSWORD);
+    // Resolve env to definite strings (fixes TS "string | undefined")
+    const email = requireEnv('LINKEDIN_EMAIL', env.LINKEDIN_EMAIL);
+    const password = requireEnv('LINKEDIN_PASSWORD', env.LINKEDIN_PASSWORD);
 
-    // Type credentials - SIMPLE approach that works
+    logger.info('[li] Typing credentials');
     await page.type('input[name="session_key"]', email, { delay: 100 });
     await sleep(500);
     await page.type('input[name="session_password"]', password, { delay: 100 });
     await sleep(500);
 
-    // Click submit
+    // Submit
+    logger.info('[li] Submitting login form');
     await page.click('button[type="submit"]');
 
     // Wait for navigation
     await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {});
     await sleep(2000);
 
-    // Save session
-    await saveSession(page);
-
     const currentUrl = page.url();
     logger.info({ currentUrl }, '[li] Login complete');
 
-    return page;
+    // Save session for next time (best-effort)
+    await saveSession(page).catch(() => {});
 
+    return page;
   } catch (err) {
     logger.error({ err }, '[li] Authentication failed');
     throw err;
@@ -87,19 +71,19 @@ export async function authenticateLinkedIn(): Promise<Page> {
 // ---------- Extract Profile Data ----------
 async function extractWorkHistory(page: Page) {
   try {
-    // Wait for experience section
     await page.waitForSelector('li.pvs-list__paged-list-item', { timeout: 10000 }).catch(() => {});
 
     return await page.evaluate(() => {
       const items: any[] = [];
       const experiences = document.querySelectorAll('li.pvs-list__paged-list-item');
 
-      experiences.forEach(exp => {
+      experiences.forEach((exp) => {
         const position = exp.querySelector('.t-bold span')?.textContent?.trim() || '';
         const company = exp.querySelector('.t-14.t-normal')?.textContent?.trim() || '';
-        const duration = Array.from(exp.querySelectorAll('.t-14.t-normal.t-black--light'))
-          .map(el => el.textContent?.trim())
-          .find(text => text?.includes('·')) || '';
+        const duration =
+          Array.from(exp.querySelectorAll('.t-14.t-normal.t-black--light'))
+            .map((el) => el.textContent?.trim())
+            .find((text) => text?.includes('·')) || '';
 
         if (position || company) {
           items.push({ position, company, duration, description: '' });
@@ -143,29 +127,29 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
     // Authenticate
     page = await authenticateLinkedIn();
 
-    // Go to profile
+    // Navigate to profile
     logger.info('[li] Navigating to profile');
     await page.goto(profileUrl, {
       waitUntil: 'networkidle2',
-      timeout: 60000
+      timeout: 60000,
     });
 
     await sleep(2000);
 
-    // Get basic info
+    // Basic info
     const basics = await extractBasicInfo(page);
 
-    // Try to get experience from main page first
+    // Work history (main page first)
     let workHistory = await extractWorkHistory(page);
 
-    // If no experience found, try details page
+    // If not present, try details page
     if (workHistory.length === 0) {
       const detailsUrl = `${profileUrl.replace(/\/$/, '')}/details/experience/`;
       logger.info('[li] Trying experience details page');
 
       await page.goto(detailsUrl, {
         waitUntil: 'networkidle2',
-        timeout: 60000
+        timeout: 60000,
       });
 
       await sleep(2000);
@@ -180,9 +164,8 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
       workHistory,
       education: [],
       skills: [],
-      connections: 0
+      connections: 0,
     };
-
   } catch (err) {
     logger.error({ err, profileUrl }, '[li] Scrape failed');
     throw err;
@@ -209,7 +192,7 @@ export function parseLinkedInProfile(rawData: any): LinkedInProfile {
       duration: x.duration || '',
       startDate: '',
       endDate: '',
-      description: x.description || ''
+      description: x.description || '',
     }));
 
   return {
@@ -221,6 +204,6 @@ export function parseLinkedInProfile(rawData: any): LinkedInProfile {
     education: rawData?.education || [],
     skills: rawData?.skills || [],
     connections: 0,
-    profileStrength: Math.min((rawData?.workHistory?.length || 0) * 20 + 20, 100)
+    profileStrength: Math.min((rawData?.workHistory?.length || 0) * 20 + 20, 100),
   };
 }
