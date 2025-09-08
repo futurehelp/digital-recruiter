@@ -45,8 +45,12 @@ async function waitForAnySelector(
   const start = Date.now();
   while (Date.now() - start < timeout) {
     for (const sel of selectors) {
-      const found = await page.$(sel);
-      if (found) return sel;
+      try {
+        const found = await page.$(sel);
+        if (found) return sel;
+      } catch {
+        /* ignore bad selectors just in case */
+      }
     }
     await sleep(300);
   }
@@ -68,36 +72,59 @@ async function debugDump(page: Page, tag: string) {
 }
 
 async function handleCookieBanner(page: Page) {
-  // Various “Accept” banners LinkedIn shows
-  const selectors = [
-    'button[action-type="ACCEPT"]',
-    'button[aria-label*="Accept"]',
-    'button[aria-label*="accept"]',
-    'button:has-text("Accept")',
-    'button:has-text("I accept")',
-    'button:has-text("Allow all")',
-    'button.cookie-consent-accept',
-  ];
-
-  for (const sel of selectors) {
-    const el = await page.$(sel);
-    if (el) {
-      await el.click().catch(() => {});
-      await sleep(400);
-      break;
+  // Puppeteer-safe: scan all buttons by text
+  const clicked = await page.evaluate(() => {
+    const tryTexts = ['accept', 'allow all', 'i accept', 'agree'];
+    const btns = Array.from(document.querySelectorAll('button'));
+    for (const b of btns) {
+      const t = (b.textContent || '').trim().toLowerCase();
+      if (tryTexts.some((x) => t.includes(x))) {
+        (b as HTMLButtonElement).click();
+        return true;
+      }
     }
+    return false;
+  });
+  if (clicked) await sleep(400);
+}
+
+async function clickByText(page: Page, texts: string[]) {
+  const handle = await page.evaluateHandle((btnTexts: string[]) => {
+    const btns = Array.from(document.querySelectorAll('button'));
+    const lowers = btnTexts.map((t) => t.toLowerCase());
+    return (
+      btns.find((b) => {
+        const t = (b.textContent || '').toLowerCase();
+        return lowers.some((x) => t.includes(x));
+      }) || null
+    );
+  }, texts);
+
+  try {
+    if (handle) {
+      const el = handle.asElement();
+      if (el) {
+        // IMPORTANT: use evaluate to click to avoid Element vs Node type mismatch
+        await el.evaluate((btn) => (btn as HTMLElement).click()).catch(() => {});
+        await sleep(800);
+      }
+    }
+  } catch {
+    /* ignore */
+  } finally {
+    try {
+      // @ts-ignore - dispose if it’s a JSHandle
+      await (handle as any)?.dispose?.();
+    } catch {}
   }
 }
 
 /* ------------------------------ authentication ---------------------------- */
 
-/**
- * Try session cookies first. If invalid or missing, do fresh login.
- */
 export async function authenticateLinkedIn(): Promise<Page> {
   const page = await newPage();
 
-  // Be explicit about realistic UA; you already set headful, but this helps EC2.
+  // Be explicit about UA on EC2
   await page.setUserAgent(
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
       '(KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36'
@@ -109,7 +136,7 @@ export async function authenticateLinkedIn(): Promise<Page> {
     if (loaded) {
       await page.goto('https://www.linkedin.com/feed/', {
         waitUntil: 'domcontentloaded',
-        timeout: env.PAGE_TIMEOUT_MS,
+        timeout: env.PAGE_TIMEOUT_MS
       });
       const url = page.url();
       logger.info({ url }, '[li] session check /feed');
@@ -131,7 +158,7 @@ export async function authenticateLinkedIn(): Promise<Page> {
   logger.info('[li] goto login');
   await page.goto('https://www.linkedin.com/login', {
     waitUntil: 'domcontentloaded',
-    timeout: env.PAGE_TIMEOUT_MS,
+    timeout: env.PAGE_TIMEOUT_MS
   });
 
   try {
@@ -165,20 +192,11 @@ export async function authenticateLinkedIn(): Promise<Page> {
   logger.info({ currentUrl }, '[li] post-login URL');
   if (currentUrl.includes('/checkpoint') || currentUrl.includes('/challenge')) {
     logger.warn('[li] checkpoint/challenge detected');
-    // Often a “Continue” button is present; try it once.
-    const contSel = [
-      'button:has-text("Continue")',
-      'button[aria-label*="Continue"]',
-      'button:has-text("Verify")',
-    ];
-    for (const s of contSel) {
-      const btn = await page.$(s);
-      if (btn) {
-        await btn.click().catch(() => {});
-        await sleep(1000);
-        break;
-      }
-    }
+    // Try a generic "Continue"/"Verify" click, Puppeteer-safe
+    await clickByText(page, ['continue', 'verify', 'next']);
+    await handleCookieBanner(page);
+    // Give it a moment to advance if it can
+    await sleep(1500);
   }
 
   // Cookie banner sometimes appears right after login
@@ -186,12 +204,12 @@ export async function authenticateLinkedIn(): Promise<Page> {
 
   if (!currentUrl.includes('/login')) {
     logger.info('[li] authenticated (fresh login)');
-    await saveSession(page); // ✅ save new cookies for reuse
+    await saveSession(page); // save new cookies for reuse
     return page;
   }
 
   await debugDump(page, 'login-failed');
-  const bodyText = await page.$eval('body', (b) => b.innerText).catch(() => '');
+  const bodyText = await page.$eval('body', (b) => (b as HTMLElement).innerText).catch(() => '');
   logger.error(
     { currentUrl, bodySnippet: bodyText?.slice(0, 200) || '' },
     '[li] authentication failed'
@@ -216,34 +234,26 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
 
     await page.goto(detailsUrl, {
       waitUntil: 'domcontentloaded',
-      timeout: env.PAGE_TIMEOUT_MS,
+      timeout: env.PAGE_TIMEOUT_MS
     });
 
     await handleCookieBanner(page);
 
-    // LinkedIn changes this DOM a lot; check several anchors instead of one
+    // Try several anchors (LinkedIn DOM changes a lot)
     const experienceAnchors = [
-      '.optional-action-target-wrapper',                   // your original
-      'section[data-view-name*="experience"]',            // newer LI IA
-      'section:has(h2:has-text("Experience"))',           // text-based fallback
-      'main[role="main"]',                                // generic fallback
-      '#profile-content',                                  // legacy container
+      '.optional-action-target-wrapper',                // original
+      'section[data-view-name*="experience"]',         // new IA
+      '#profile-content',                              // legacy container
+      'main[role="main"]'                              // generic fallback
     ];
 
-    const hit = await waitForAnySelector(
-      page,
-      experienceAnchors,
-      env.ELEMENT_TIMEOUT_MS
-    );
-
+    const hit = await waitForAnySelector(page, experienceAnchors, env.ELEMENT_TIMEOUT_MS);
     if (!hit) {
       await debugDump(page, 'experience-timeout');
-      throw new Error(
-        'Experience section not found in time (dump saved to /home/ubuntu)'
-      );
+      throw new Error('Experience section not found in time');
     }
 
-    // Small settle + scroll to hydrate lazy content
+    // Hydrate lazy content
     await sleep(1500);
     await scrollToBottom(page);
     await sleep(800);
@@ -252,39 +262,40 @@ export async function scrapeLinkedInProfile(profileUrl: string): Promise<any> {
     const workHistory = await page.evaluate(() => {
       const clean = (t?: string | null) => (t || '').replace(/\s+/g, ' ').trim();
 
-      // Try to scope to experience section if possible
       const expRoot =
         document.querySelector('section[data-view-name*="experience"]') ||
-        document.querySelector('section:has(h2:has-text("Experience"))') ||
+        document.querySelector('#profile-content') ||
         document;
 
-      return Array.from(expRoot.querySelectorAll('li')).map((li) => {
-        const position = clean(li.querySelector('.t-bold')?.textContent);
-        const company = clean(
-          li.querySelector('.t-14.t-normal')?.textContent ||
-            li.querySelector('.t-normal span')?.textContent
-        );
-        const duration = clean(
-          li.querySelector('.t-14.t-black--light')?.textContent ||
-            li.querySelector('.t-14.t-normal.t-black--light')?.textContent
-        );
-        const description = clean(
-          li.querySelector('.pv-shared-text-with-see-more')?.textContent ||
-            li.querySelector('.inline-show-more-text')?.textContent
-        );
+      return Array.from(expRoot.querySelectorAll('li'))
+        .map((li) => {
+          const position = clean(li.querySelector('.t-bold')?.textContent);
+          const company = clean(
+            li.querySelector('.t-14.t-normal')?.textContent ||
+              li.querySelector('.t-normal span')?.textContent
+          );
+          const duration = clean(
+            li.querySelector('.t-14.t-black--light')?.textContent ||
+              li.querySelector('.t-14.t-normal.t-black--light')?.textContent
+          );
+          const description = clean(
+            li.querySelector('.pv-shared-text-with-see-more')?.textContent ||
+              li.querySelector('.inline-show-more-text')?.textContent
+          );
 
-        if (position || company) {
-          return { position, company, duration, description };
-        }
-        return null;
-      }).filter(Boolean);
+          if (position || company) {
+            return { position, company, duration, description };
+          }
+          return null;
+        })
+        .filter(Boolean);
     });
 
-    // Basic profile info still comes from main page
+    // Basic profile info from main page
     logger.info('[li] back to main profile for summary');
     await page.goto(profileUrl, {
       waitUntil: 'domcontentloaded',
-      timeout: env.PAGE_TIMEOUT_MS,
+      timeout: env.PAGE_TIMEOUT_MS
     });
 
     await handleCookieBanner(page);
