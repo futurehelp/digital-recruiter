@@ -1,3 +1,2 @@
-2025/09/07-14:49:24.940 11528d6 Reusing MANIFEST /Users/weave/Desktop/drew/digital-recruiter/chrome-profile-local/Default/IndexedDB/https_www.linkedin.com_0.indexeddb.leveldb/MANIFEST-000001
-2025/09/07-14:49:24.940 11528d6 Recovering log #4
-2025/09/07-14:49:24.941 11528d6 Reusing old log /Users/weave/Desktop/drew/digital-recruiter/chrome-profile-local/Default/IndexedDB/https_www.linkedin.com_0.indexeddb.leveldb/000004.log 
+2025/09/08-16:55:25.915 14a9382 Creating DB /Users/weave/Desktop/drew/digital-recruiter/chrome-profile-local/Default/IndexedDB/https_www.linkedin.com_0.indexeddb.leveldb since it was missing.
+2025/09/08-16:55:25.917 14a9382 Reusing MANIFEST /Users/weave/Desktop/drew/digital-recruiter/chrome-profile-local/Default/IndexedDB/https_www.linkedin.com_0.indexeddb.leveldb/MANIFEST-000001
