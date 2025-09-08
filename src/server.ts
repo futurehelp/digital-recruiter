@@ -1,3 +1,4 @@
+// src/server.ts
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -11,7 +12,6 @@ import { router } from './routes';
 import { errorHandler } from './middleware/errorHandler';
 import { logger } from './lib/logger';
 import { getBrowser, newPage } from './lib/browser';
-import { env } from './lib/env';
 
 function scrubBody(body: any) {
   try {
@@ -26,6 +26,7 @@ function scrubBody(body: any) {
 
 export async function createServer() {
   const app = express();
+
   app.set('trust proxy', 1);
 
   app.use(helmet());
@@ -97,7 +98,7 @@ export async function createServer() {
     })
   );
 
-  // Health endpoint (Railway healthcheck hits this)
+  // Health endpoint
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
   });
@@ -111,23 +112,36 @@ export async function createServer() {
       await page.goto('about:blank', { waitUntil: 'domcontentloaded' }).catch(() => {});
       const ua = await page.evaluate(() => navigator.userAgent).catch(() => 'n/a');
       await page.close().catch(() => {});
-      res.json({
-        ok: true,
-        version,
-        ua,
-        headful: process.env.HEADFUL,
-        exec: process.env.PUPPETEER_EXECUTABLE_PATH || '(auto)',
-        proxy: {
-          enabled: env.PROXY_ENABLED,
-          server: env.PROXY_SERVER || 'unset',
-          bypass: env.PROXY_BYPASS,
-          usernameSet: Boolean(env.PROXY_USERNAME),
-          passwordSet: Boolean(env.PROXY_PASSWORD)
-        }
-      });
+      res.json({ ok: true, version, ua, headful: process.env.HEADFUL, exec: process.env.PUPPETEER_EXECUTABLE_PATH });
     } catch (err) {
       next(err);
     }
+  });
+
+  // 🔊 Minimal SSE stream so the frontend's EventSource doesn't 404
+  app.get('/api/progress/stream', (req: Request, res: Response) => {
+    // Basic CORS for your Vercel frontend
+    res.setHeader('Access-Control-Allow-Origin', 'https://linkedin-digital-recruiter-frontend.vercel.app');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    // Flush headers for proxies
+    (res as any).flushHeaders?.();
+
+    // Initial event
+    res.write(`event: hello\ndata: {"ok":true}\n\n`);
+
+    // Heartbeat keepalive (avoid idle timeouts on ALB / proxies)
+    const timer = setInterval(() => {
+      res.write(`event: ping\ndata: {"t":${Date.now()}}\n\n`);
+    }, 25000);
+
+    req.on('close', () => {
+      clearInterval(timer);
+      try { res.end(); } catch { /* ignore */ }
+    });
   });
 
   // Your API routes
