@@ -9,7 +9,11 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { env } from './env';
 import { logger } from './logger';
 
-puppeteerExtra.use(StealthPlugin());
+// Use stealth plugin with all evasions
+const stealth = StealthPlugin();
+stealth.enabledEvasions.delete('iframe.contentWindow');
+stealth.enabledEvasions.delete('media.codecs');
+puppeteerExtra.use(stealth);
 
 let browser: Browser | null = null;
 let lastRequestTime = 0;
@@ -17,7 +21,7 @@ let lastRequestTime = 0;
 /* ───────────────────────── rate limiter ───────────────────────── */
 export const limiter = new Bottleneck({
   minTime: Number.isFinite(env.REQUEST_DELAY_MS) ? env.REQUEST_DELAY_MS : 45_000,
-  maxConcurrent: 1
+  maxConcurrent: 1,
 });
 
 /* ───────────────────────── helpers ───────────────────────── */
@@ -37,7 +41,7 @@ function resolveExecutablePath(): string | undefined {
     '/usr/bin/google-chrome',
     '/usr/bin/google-chrome-stable',
     '/usr/bin/chromium',
-    '/usr/bin/chromium-browser'
+    '/usr/bin/chromium-browser',
   ]);
   if (linux) {
     logger.info({ executablePath: linux }, '[browser] using system Chromium');
@@ -63,7 +67,9 @@ function resolveExecutablePath(): string | undefined {
 function ensureDir(p: string) {
   try {
     fs.mkdirSync(p, { recursive: true });
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
 }
 
 /**
@@ -76,7 +82,7 @@ function unlockChromeProfile(userDataDir: string) {
     const targets = entries
       .filter((e) => e.isFile())
       .map((e) => e.name)
-      .filter((name) => /^Singleton(Browser|Cookie|Lock|Socket)$/i.test(name));
+      .filter((name) => /^(Singleton|\.com\.google\.Chrome)(Browser|Cookie|Lock|Socket)/i.test(name));
 
     for (const name of targets) {
       const full = path.join(userDataDir, name);
@@ -92,29 +98,32 @@ function unlockChromeProfile(userDataDir: string) {
   }
 }
 
-/** Build a **Linux** desktop UA that matches the *actual* Chrome major version. */
-async function computeLinuxUA(b: Browser): Promise<string> {
-  // e.g. "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)
-  //  Chrome/126.0.0.0 Safari/537.36"
+/** Build a realistic UA that matches the actual Chrome version */
+async function computeRealisticUA(b: Browser): Promise<string> {
   let major = 120;
   try {
-    const v = await b.version(); // "HeadlessChrome/126.0.6478.126" or "Chrome/126.0..."
+    const v = await b.version();
     const m = v.match(/Chrome\/(\d+)/i);
     if (m) major = parseInt(m[1], 10);
-  } catch { /* ignore */ }
-  return `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+  } catch {
+    /* ignore */
+  }
+
+  // Use Windows UA - less suspicious for LinkedIn
+  return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
 }
 
 /* ───────────────────────── browser lifecycle ───────────────────────── */
 async function innerLaunch(): Promise<Browser> {
   const executablePath = resolveExecutablePath();
 
-  // Force HEADFUL when env.HEADFUL is true; otherwise follow PUPPETEER_HEADLESS
+  // Force HEADFUL when env.HEADFUL is true
   const headless = env.HEADFUL ? false : !!env.PUPPETEER_HEADLESS;
 
   // Ensure DISPLAY is set for headful under Xvfb on EC2
-  if (!process.env.DISPLAY) {
+  if (!headless && !process.env.DISPLAY) {
     process.env.DISPLAY = ':99';
+    logger.info('[browser] Set DISPLAY=:99 for headful mode');
   }
 
   // User data dir: persist cookies / sessions across runs
@@ -127,30 +136,68 @@ async function innerLaunch(): Promise<Browser> {
   // proactively clear stale singleton locks
   unlockChromeProfile(userDataDir);
 
-  // IMPORTANT: remove suspicious flags that trip LI bot controls
+  // CRITICAL: These args are tuned for LinkedIn anti-detection + EC2 memory constraints
   const args = [
     `--user-data-dir=${userDataDir}`,
     '--profile-directory=Default',
+
+    // Required for EC2
     '--no-sandbox',
     '--disable-setuid-sandbox',
     '--disable-dev-shm-usage',
-    '--disable-gpu', // under Xvfb
-    '--window-size=1366,900',
-    '--lang=en-US,en',
+
+    // Memory optimization
+    '--single-process',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-features=TranslateUI',
+    '--disable-ipc-flooding-protection',
+    '--max_old_space_size=512',
+
+    // Display settings
+    '--window-size=1920,1080',
+    '--start-maximized',
+    '--disable-gpu',
+    '--disable-software-rasterizer',
+
+    // Critical anti-detection flags
     '--disable-blink-features=AutomationControlled',
-    // Less suspicious than disabling site isolation entirely:
-    // (omit --disable-features=IsolateOrigins,site-per-process)
-    '--password-store=basic',
+    '--exclude-switches=enable-automation',
+    '--disable-infobars',
+    '--disable-features=site-per-process,IsolateOrigins',
+    '--disable-site-isolation-trials',
+    '--flag-switches-begin',
+    '--flag-switches-end',
+
+    // Language and locale
+    '--lang=en-US,en',
+    '--accept-lang=en-US,en;q=0.9',
+
+    // Permissions and features
+    '--allow-running-insecure-content',
+    '--disable-features=UserAgentClientHint,ImprovedCookieControls,RendererCodeIntegrity,FlashDeprecationWarning,EnablePasswordsAccountStorage,ChromeWhatsNewUI',
     '--enable-features=NetworkService,NetworkServiceInProcess',
-    // DO NOT expose remote debugging in production; LI can detect it.
-    // (omit --remote-debugging-port)
-    '--autoplay-policy=no-user-gesture-required',
+
+    // Audio/Video fake devices
+    '--use-fake-device-for-media-stream',
+    '--use-fake-ui-for-media-stream',
+
+    // Other
+    '--password-store=basic',
     '--no-first-run',
-    '--no-default-browser-check'
-    // (omit --disable-web-security)
+    '--no-default-browser-check',
+    '--disable-component-extensions-with-background-pages',
+    '--disable-default-apps',
+    '--disable-breakpad',
+    '--disable-hang-monitor',
+    '--disable-sync',
+    '--metrics-recording-only',
+    '--no-pings',
+    '--autoplay-policy=no-user-gesture-required',
   ];
 
-  // Proxy support (Decodo)
+  // Proxy support
   if (env.PROXY_ENABLED && env.PROXY_SERVER) {
     args.push(`--proxy-server=${env.PROXY_SERVER}`);
     if (env.PROXY_BYPASS?.trim()) {
@@ -162,8 +209,12 @@ async function innerLaunch(): Promise<Browser> {
     headless,
     executablePath,
     args,
-    defaultViewport: { width: 1366, height: 900, deviceScaleFactor: 1 },
-    protocolTimeout: Math.max(Number(env.PAGE_TIMEOUT_MS) || 0, 120_000)
+    defaultViewport: null, // Use full window
+    ignoreDefaultArgs: ['--enable-automation', '--enable-blink-features=IdleDetection'],
+    handleSIGINT: false,
+    handleSIGTERM: false,
+    handleSIGHUP: false,
+    protocolTimeout: Math.max(Number(env.PAGE_TIMEOUT_MS) || 0, 180_000),
   };
 
   logger.info(
@@ -176,23 +227,23 @@ async function innerLaunch(): Promise<Browser> {
       proxy: {
         enabled: env.PROXY_ENABLED,
         server: env.PROXY_SERVER || 'unset',
-        bypass: env.PROXY_BYPASS
       },
-      args
     },
-    '[browser] launching (EC2 HEADFUL)'
+    '[browser] launching (EC2 HEADFUL with enhanced stealth)',
   );
 
   const b = await puppeteerExtra.launch(opts);
 
   b.on('disconnected', async () => {
     logger.warn('[browser] disconnected — will relaunch on next request');
-    try { browser?.removeAllListeners?.(); } catch {}
+    try {
+      browser?.removeAllListeners?.();
+    } catch {}
     browser = null;
   });
 
   const version = await b.version().catch(() => 'unknown');
-  logger.info({ version }, '[browser] launched');
+  logger.info({ version }, '[browser] launched successfully');
 
   return b;
 }
@@ -202,15 +253,23 @@ async function launchBrowser(): Promise<Browser> {
     return await innerLaunch();
   } catch (err: any) {
     const msg = String(err?.message || err);
-    if (/profile appears to be in use/i.test(msg)) {
-      logger.warn({ err }, '[browser] launch failed due to profile lock — unlocking & retrying once');
+    if (/profile appears to be in use/i.test(msg) || /lock file/i.test(msg)) {
+      logger.warn({ err }, '[browser] launch failed due to profile lock — unlocking & retrying');
       try {
         const dir =
           env.CHROME_USER_DATA_DIR && env.CHROME_USER_DATA_DIR.trim()
             ? path.resolve(env.CHROME_USER_DATA_DIR)
             : path.join(os.homedir(), 'chrome-profile-ec2');
         unlockChromeProfile(dir);
-      } catch {/* ignore */}
+        // Also try to kill any hanging Chrome processes
+        const { exec } = require('child_process');
+        await new Promise((resolve) => {
+          exec('pkill -f "chrome|chromium"', () => resolve(null));
+        });
+        await new Promise((r) => setTimeout(r, 2000));
+      } catch {
+        /* ignore */
+      }
       return await innerLaunch();
     }
     throw err;
@@ -227,7 +286,9 @@ export async function getBrowser(): Promise<Browser> {
       try {
         browser?.removeAllListeners?.();
         await browser?.close?.();
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
       browser = null;
     }
   }
@@ -235,7 +296,7 @@ export async function getBrowser(): Promise<Browser> {
   return browser!;
 }
 
-/* ───────────────────────── new pages (fingerprint) ───────────────────────── */
+/* ───────────────────────── new pages with maximum stealth ───────────────────────── */
 export async function newPage(): Promise<Page> {
   try {
     const b = await getBrowser();
@@ -246,7 +307,7 @@ export async function newPage(): Promise<Page> {
       try {
         await page.authenticate({
           username: env.PROXY_USERNAME,
-          password: env.PROXY_PASSWORD
+          password: env.PROXY_PASSWORD,
         });
         logger.debug('[browser] proxy credentials applied to page');
       } catch (err) {
@@ -256,65 +317,232 @@ export async function newPage(): Promise<Page> {
 
     // Timeouts tuned for slower EC2 CPUs
     try {
-      page.setDefaultNavigationTimeout(Number(env.PAGE_TIMEOUT_MS) || 120_000);
-      page.setDefaultTimeout(Number(env.ELEMENT_TIMEOUT_MS) || 45_000);
-    } catch { /* ignore */ }
+      page.setDefaultNavigationTimeout(Number(env.PAGE_TIMEOUT_MS) || 180_000);
+      page.setDefaultTimeout(Number(env.ELEMENT_TIMEOUT_MS) || 60_000);
+    } catch {
+      /* ignore */
+    }
 
-    // Build a Linux UA that matches the actual Chrome version
-    const linuxUA = await computeLinuxUA(b);
-    await page.setUserAgent(linuxUA);
+    // Use Windows UA for better LinkedIn compatibility
+    const windowsUA = await computeRealisticUA(b);
+    await page.setUserAgent(windowsUA);
 
-    await page.setViewport({ width: 1366, height: 900, deviceScaleFactor: 1 });
-    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
-    await page.setBypassCSP(true);
+    await page.setViewport({ width: 1920, height: 1080, deviceScaleFactor: 1 });
 
-    // Stealth hardening: align platform/capabilities to Linux desktop
+    // Set realistic headers
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'en-US,en;q=0.9',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Encoding': 'gzip, deflate, br',
+      Connection: 'keep-alive',
+      'Upgrade-Insecure-Requests': '1',
+    });
+
+    // CRITICAL: Maximum stealth evasions — runs in page context
     await page.evaluateOnNewDocument(() => {
+      // Remove webdriver property completely
       try {
-        Object.defineProperty(navigator, 'platform', { get: () => 'Linux x86_64' });
-        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-
-        // Plugins presence (common on Linux Chrome)
-        Object.defineProperty(navigator, 'plugins', {
-          get: () =>
-            [
-              { name: 'Chromium PDF Plugin' },
-              { name: 'Chromium PDF Viewer' },
-              { name: 'Native Client' }
-            ] as any
+        // @ts-ignore
+        const newProto = navigator.__proto__;
+        // @ts-ignore
+        delete newProto.webdriver;
+        // @ts-ignore
+        navigator.__proto__ = newProto;
+      } catch {
+        Object.defineProperty(navigator, 'webdriver', {
+          get: () => undefined,
         });
+      }
 
-        // Tweak WebGL vendor/renderer
+      // Ensure window.chrome exists
+      // @ts-ignore
+      if (!window.chrome) {
+        // @ts-ignore
+        window.chrome = {
+          runtime: {
+            connect: () => ({
+              disconnect: () => {},
+              onDisconnect: { addListener: () => {} },
+              onMessage: { addListener: () => {} },
+              postMessage: () => {},
+            }),
+            sendMessage: () => {},
+            onMessage: { addListener: () => {} },
+          },
+          loadTimes: function () {
+            return {
+              commitLoadTime: Date.now() / 1000,
+              connectionInfo: 'h2',
+              finishDocumentLoadTime: Date.now() / 1000,
+              finishLoadTime: Date.now() / 1000,
+              firstPaintAfterLoadTime: 0,
+              firstPaintTime: Date.now() / 1000,
+              navigationType: 'Other',
+              npnNegotiatedProtocol: 'h2',
+              requestTime: Date.now() / 1000,
+              startLoadTime: Date.now() / 1000,
+              wasAlternateProtocolAvailable: false,
+              wasFetchedViaSpdy: true,
+              wasNpnNegotiated: true,
+            };
+          },
+          csi: function () {
+            return { onloadT: Date.now(), pageT: Date.now(), startE: Date.now() - 1000 };
+          },
+          app: {
+            isInstalled: false,
+            getDetails: () => null,
+            getIsInstalled: () => false,
+            installState: () => ({
+              DISABLED: 'disabled',
+              INSTALLED: 'installed',
+              NOT_INSTALLED: 'not_installed',
+            }),
+            runningState: () => ({
+              CANNOT_RUN: 'cannot_run',
+              READY_TO_RUN: 'ready_to_run',
+              RUNNING: 'running',
+            }),
+          },
+        };
+      }
+
+      // Proper permissions handling
+      const originalQuery = window.navigator.permissions?.query;
+      if (originalQuery) {
+        // @ts-ignore
+        window.navigator.permissions.query = (parameters: any) =>
+          parameters.name === 'notifications'
+            // Use any here so TS in Node context doesn't require DOM PermissionStatus shape
+            ? Promise.resolve({ state: 'default' } as any)
+            : originalQuery(parameters);
+      }
+
+      // Realistic plugins for Windows Chrome
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => {
+          const arr: any = [
+            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: 'Portable Document Format' },
+            { name: 'Native Client', filename: 'internal-nacl-plugin', description: 'Native Client Executable' },
+          ];
+          Object.setPrototypeOf(arr, PluginArray.prototype);
+          arr.item = function (i: number) {
+            return this[i];
+          };
+          arr.namedItem = function (name: string) {
+            return this.find((p: any) => p.name === name);
+          };
+          arr.refresh = function () {
+            return undefined;
+          };
+          return arr;
+        },
+      });
+
+      // Realistic window properties
+      Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+      Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+      Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      Object.defineProperty(navigator, 'language', { get: () => 'en-US' });
+
+      // WebGL vendor strings (NVIDIA common on Windows)
+      try {
         const getParameter = WebGLRenderingContext.prototype.getParameter;
-        WebGLRenderingContext.prototype.getParameter = function (param) {
-          if (param === 37445) return 'Google Inc.'; // UNMASKED_VENDOR_WEBGL
-          if (param === 37446) return 'ANGLE (AMD, AMD Radeon, OpenGL)'; // generic Linux-y
-          return getParameter.call(this, param);
+        WebGLRenderingContext.prototype.getParameter = function (param: number) {
+          if (param === 37445) return 'Google Inc. (NVIDIA)';
+          if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 Direct3D11 vs_5_0 ps_5_0)';
+          // @ts-ignore
+          return getParameter.apply(this, [param]);
         };
 
-        // Normalize timezone (choose one; US timezones tend to look less botty than UTC)
-        try {
-          // @ts-ignore
-          Intl.DateTimeFormat = class extends Intl.DateTimeFormat {
-            constructor(locale?: any, options?: any) {
-              super(locale, { timeZone: 'America/Los_Angeles', ...(options || {}) });
-            }
+        const getParameter2 = (WebGL2RenderingContext as any)?.prototype?.getParameter;
+        if (getParameter2) {
+          (WebGL2RenderingContext as any).prototype.getParameter = function (param: number) {
+            if (param === 37445) return 'Google Inc. (NVIDIA)';
+            if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 Direct3D11 vs_5_0 ps_5_0)';
+            // @ts-ignore
+            return getParameter2.apply(this, [param]);
           };
-        } catch {}
+        }
+      } catch {}
+
+      // Battery API (plugged in on desktop)
+      if ('getBattery' in navigator) {
+        // @ts-ignore
+        navigator.getBattery = () =>
+          Promise.resolve({
+            charging: true,
+            chargingTime: 0,
+            dischargingTime: Infinity,
+            level: 1,
+            addEventListener: () => {},
+            removeEventListener: () => {},
+          });
+      }
+
+      // Fix toString methods to appear native
+      try {
+        const nativeToStringFunctionString = Error.toString().replace(/Error/g, 'toString');
+        const oldCall = Function.prototype.call;
+        // Loosen types for Node/TS
+        (Function.prototype as any).call = function (this: any, ...args: any[]) {
+          if (args[0] && (args[0] as any).toString === nativeToStringFunctionString) {
+            return nativeToStringFunctionString;
+          }
+          return (oldCall as any).apply(this, args as any);
+        };
+      } catch {}
+
+      // Console.debug fix
+      try {
+        const consoleDebug = console.debug;
+        // @ts-ignore
+        console.debug = function (...args: any[]) {
+          if (args[0] && args[0].includes && args[0].includes('function const')) return;
+          return consoleDebug.apply(console, args as any);
+        };
+      } catch {}
+
+      // Remove automation indicators
+      [
+        '__webdriver_evaluate',
+        '__selenium_evaluate',
+        '__webdriver_script_function',
+        '__webdriver_script_func',
+        '__webdriver_script_fn',
+        '__fxdriver_evaluate',
+        '__driver_unwrapped',
+        '__webdriver_unwrapped',
+        '__driver_evaluate',
+        '__selenium_unwrapped',
+        '__fxdriver_unwrapped',
+      ].forEach((prop) => {
+        // @ts-ignore
+        delete (window as any)[prop];
+        // @ts-ignore
+        delete (document as any)[prop];
+      });
+    }); // <-- end evaluateOnNewDocument
+
+    // Random mouse movement on first page load (Node context)
+    page.once('load', async () => {
+      try {
+        await page.mouse.move(100 + Math.random() * 700, 100 + Math.random() * 500);
       } catch {}
     });
 
-    logger.debug('[browser] new page created');
+    logger.debug('[browser] new stealth page created');
     return page;
   } catch (err) {
-    // One-shot retry: relaunch & try again
-    logger.warn({ err }, '[browser] newPage() failed — relaunching and retrying once');
+    logger.error({ err }, '[browser] newPage() failed — retrying with relaunch');
     try {
       browser?.removeAllListeners?.();
       await browser?.close?.();
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
     browser = null;
 
     const b = await getBrowser();
@@ -324,12 +552,13 @@ export async function newPage(): Promise<Page> {
       try {
         await page.authenticate({
           username: env.PROXY_USERNAME,
-          password: env.PROXY_PASSWORD
+          password: env.PROXY_PASSWORD,
         });
-      } catch {/* ignore */}
+      } catch {
+        /* ignore */
+      }
     }
 
-    await page.setBypassCSP(true);
     logger.debug('[browser] new page created after relaunch');
     return page;
   }
@@ -346,4 +575,17 @@ export async function enforceRateLimit() {
     await new Promise((r) => setTimeout(r, wait));
   }
   lastRequestTime = Date.now();
+}
+
+/* ───────────────────────── cleanup helper ───────────────────────── */
+export async function closeBrowser() {
+  if (browser) {
+    try {
+      await browser.close();
+      browser = null;
+      logger.info('[browser] closed successfully');
+    } catch (err) {
+      logger.error({ err }, '[browser] error closing');
+    }
+  }
 }

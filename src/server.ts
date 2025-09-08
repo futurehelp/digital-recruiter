@@ -11,7 +11,7 @@ import { randomUUID } from 'crypto';
 import { router } from './routes';
 import { errorHandler } from './middleware/errorHandler';
 import { logger } from './lib/logger';
-import { getBrowser, newPage } from './lib/browser';
+import { getBrowser, newPage, closeBrowser } from './lib/browser';
 
 function scrubBody(body: any) {
   try {
@@ -85,31 +85,156 @@ export async function createServer() {
 
   // Health endpoint
   app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({ 
+      status: 'ok', 
+      timestamp: new Date().toISOString(),
+      environment: 'ec2',
+      memory: process.memoryUsage(),
+      uptime: process.uptime()
+    });
   });
 
-  // Debug browser preflight
+  // Debug browser preflight - Enhanced version
   app.get('/debug/preflight', async (_req, res, next) => {
     try {
       const browser = await getBrowser();
       const version = await browser.version().catch(() => 'unknown');
       const page = await newPage();
+      
+      // Test basic navigation
       await page.goto('about:blank', { waitUntil: 'domcontentloaded' }).catch(() => {});
       const ua = await page.evaluate(() => navigator.userAgent).catch(() => 'n/a');
+      
+      // Test webdriver detection
+      const webdriverDetected = await page.evaluate(() => {
+        return !!(navigator as any).webdriver;
+      }).catch(() => 'unknown');
+      
+      // Test Chrome object
+      const chromeExists = await page.evaluate(() => {
+        return typeof (window as any).chrome !== 'undefined';
+      }).catch(() => false);
+      
       await page.close().catch(() => {});
+      
       res.json({
         ok: true,
         version,
         ua,
-        headful: process.env.HEADFUL,
-        exec: process.env.PUPPETEER_EXECUTABLE_PATH,
+        headful: process.env.HEADFUL || !process.env.PUPPETEER_HEADLESS,
+        exec: process.env.PUPPETEER_EXECUTABLE_PATH || 'auto',
+        display: process.env.DISPLAY,
+        webdriverDetected,
+        chromeExists,
+        memory: process.memoryUsage(),
+        proxy: {
+          enabled: process.env.PROXY_ENABLED === 'true',
+          server: process.env.PROXY_SERVER ? 'configured' : 'not-configured'
+        }
       });
     } catch (err) {
       next(err);
     }
   });
 
-  // SSE stream
+  // Browser health check endpoint
+  app.get('/debug/browser-health', async (_req, res, next) => {
+    try {
+      const browser = await getBrowser();
+      const pages = await browser.pages();
+      const version = await browser.version();
+      
+      // Get page metrics if available
+      let metrics = {};
+      if (pages.length > 0) {
+        metrics = await pages[0].metrics().catch(() => ({}));
+      }
+      
+      res.json({
+        healthy: true,
+        pages: pages.length,
+        version,
+        memory: process.memoryUsage(),
+        metrics,
+        uptime: process.uptime(),
+        display: process.env.DISPLAY,
+        timestamp: new Date().toISOString()
+      });
+    } catch (err: any) {
+      res.status(500).json({ 
+        healthy: false,
+        error: err.message,
+        timestamp: new Date().toISOString()
+      });
+    }
+  });
+
+  // Test LinkedIn access (without login)
+  app.get('/debug/test-linkedin', async (_req, res, next) => {
+    let page: any = null;
+    try {
+      const { newPage } = await import('./lib/browser');
+      page = await newPage();
+      
+      // Navigate to LinkedIn public page
+      await page.goto('https://www.linkedin.com/company/linkedin', {
+        waitUntil: 'networkidle2',
+        timeout: 30000
+      });
+      
+      // Check if we can see the page
+      const title = await page.title();
+      const url = page.url();
+      
+      // Check for bot detection
+      const blocked = await page.evaluate(() => {
+        const bodyText = document.body?.innerText || '';
+        return bodyText.includes('robot') || 
+               bodyText.includes('captcha') || 
+               bodyText.includes('suspicious');
+      });
+      
+      await page.close();
+      
+      res.json({
+        success: true,
+        title,
+        url,
+        blocked,
+        timestamp: new Date().toISOString()
+      });
+    } catch (err: any) {
+      if (page) await page.close().catch(() => {});
+      res.status(500).json({
+        success: false,
+        error: err.message,
+        timestamp: new Date().toISOString()
+      });
+    }
+  });
+
+  // Force browser restart endpoint
+  app.post('/debug/restart-browser', async (_req, res, next) => {
+    try {
+      await closeBrowser();
+      const browser = await getBrowser();
+      const version = await browser.version();
+      
+      res.json({
+        restarted: true,
+        version,
+        timestamp: new Date().toISOString()
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        restarted: false,
+        error: err.message,
+        timestamp: new Date().toISOString()
+      });
+    }
+  });
+
+  // SSE stream (unchanged)
   app.get('/api/progress/stream', (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -140,6 +265,19 @@ export async function createServer() {
 
   // Error handler
   app.use(errorHandler);
+
+  // Graceful shutdown handler
+  process.on('SIGTERM', async () => {
+    logger.info('SIGTERM received, closing browser...');
+    await closeBrowser();
+    process.exit(0);
+  });
+
+  process.on('SIGINT', async () => {
+    logger.info('SIGINT received, closing browser...');
+    await closeBrowser();
+    process.exit(0);
+  });
 
   return app;
 }
